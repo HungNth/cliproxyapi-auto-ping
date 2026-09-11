@@ -9,7 +9,7 @@ metadata:
   config_fields:
     - name: "auto_ping_enabled"
       type: "boolean"
-      description: "Explicit opt-in for background Codex inference requests."
+      description: "Set to false to disable background Codex inference requests."
     - name: "scan_interval"
       type: "string"
       description: "Quota scan interval as a Go duration, for example 1m, 30s."
@@ -51,7 +51,7 @@ metadata:
       type: "string"
       description: "Path to the persistent state JSON file."
 defaults:
-  auto_ping_enabled: false
+  auto_ping_enabled: true
   scan_interval: "1m"
   activation_delay: "5s"
   retry_cooldown: "15m"
