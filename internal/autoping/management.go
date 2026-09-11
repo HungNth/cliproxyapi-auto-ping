@@ -7,11 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
-
-const pluginID = "auto-ping"
 
 type rpcEnvelope struct {
 	OK     bool            `json:"ok"`
@@ -26,6 +25,7 @@ type rpcError struct {
 
 type registrationResult struct {
 	SchemaVersion int             `json:"schema_version"`
+	ID            string          `json:"id,omitempty"`
 	Metadata      pluginMetadata  `json:"metadata"`
 	Capabilities  map[string]bool `json:"capabilities"`
 }
@@ -106,7 +106,7 @@ func (r *Runtime) Handle(ctx context.Context, method string, request []byte) []b
 		if err != nil {
 			return failureEnvelope("invalid_config", err.Error())
 		}
-		cfg, err := ParseConfig(configData)
+		cfg, err := r.parseConfig(configData)
 		if err != nil {
 			return failureEnvelope("invalid_config", err.Error())
 		}
@@ -121,9 +121,9 @@ func (r *Runtime) Handle(ctx context.Context, method string, request []byte) []b
 		return successEnvelope(map[string]bool{"shutdown": true})
 	case "management.register":
 		return successEnvelope(managementRegistration{Routes: []managementRoute{
-			{Method: http.MethodGet, Path: "/auto-ping/status", Description: "Show Codex five-hour auto-ping status."},
-			{Method: http.MethodGet, Path: "/auto-ping/diagnostics", Description: "Explain per-credential auto-ping decisions."},
-			{Method: http.MethodPost, Path: "/auto-ping/ping", Description: "Send a manual targeted Codex ping."},
+			{Method: http.MethodGet, Path: r.routePath("/status"), Description: "Show Codex five-hour auto-ping status."},
+			{Method: http.MethodGet, Path: r.routePath("/diagnostics"), Description: "Explain per-credential auto-ping decisions."},
+			{Method: http.MethodPost, Path: r.routePath("/ping"), Description: "Send a manual targeted Codex ping."},
 		}})
 	case "management.handle":
 		response, err := r.handleManagement(ctx, request)
@@ -145,31 +145,46 @@ func (r *Runtime) Handle(ctx context.Context, method string, request []byte) []b
 func (r *Runtime) registration() registrationResult {
 	return registrationResult{
 		SchemaVersion: 1,
+		ID:            r.manifest.ID,
 		Metadata: pluginMetadata{
-			Name:             "Codex 5h Auto-Ping",
-			Version:          r.version,
-			Author:           "HungNth",
-			GitHubRepository: "https://github.com/HungNth/cliproxyapi-auto-ping",
-			Description:      "Starts inactive Codex rolling five-hour windows with one minimal targeted request.",
-			ConfigFields: []configField{
-				{Name: "auto_ping_enabled", Type: "boolean", Description: "Explicit opt-in for background Codex inference requests (Default: false).", DefaultValue: false},
-				{Name: "scan_interval", Type: "string", Description: "Quota scan interval as a Go duration, for example 1m, 30s (Default: 1m).", DefaultValue: "1m"},
-				{Name: "activation_delay", Type: "string", Description: "Safety delay after a fixed reset boundary before pinging (Default: 5s).", DefaultValue: "5s"},
-				{Name: "retry_cooldown", Type: "string", Description: "Cooldown delay before retrying after an activation failure (Default: 15m).", DefaultValue: "15m"},
-				{Name: "max_concurrency", Type: "integer", Description: "Maximum number of credentials processed concurrently (Default: 1).", DefaultValue: 1},
-				{Name: "request_timeout", Type: "string", Description: "Timeout for quota observation and inference requests (Default: 60s).", DefaultValue: "60s"},
-				{Name: "prompt", Type: "string", Description: "Minimal prompt text sent to Codex (Default: ping).", DefaultValue: "ping"},
-				{Name: "max_output_tokens", Type: "integer", Description: "Maximum output tokens requested from Codex (Default: 1).", DefaultValue: 1},
-				{Name: "model", Type: "string", Description: "Explicit model name or 'auto' (Default: auto).", DefaultValue: "auto"},
-				{Name: "model_candidates", Type: "array", Description: "Ordered list of model candidates to try when model=auto (Default: [gpt-5.5, gpt-5.6-luna]).", DefaultValue: []string{"gpt-5.5", "gpt-5.6-luna"}},
-				{Name: "transport", Type: "enum", EnumValues: []string{TransportDirectHTTP, TransportSchedulerBoost}, Description: "Primary activation transport: direct_http or scheduler_boost (Default: direct_http).", DefaultValue: TransportDirectHTTP},
-				{Name: "scheduler_boost_fallback", Type: "boolean", Description: "Fall back to scheduler_boost only on transport/host failures (Default: true).", DefaultValue: true},
-				{Name: "exclude_credentials", Type: "array", Description: "List of credential IDs excluded from automatic pings (Default: []).", DefaultValue: []string{}},
-				{Name: "state_path", Type: "string", Description: "Path to the persistent state JSON file (Default: auto-ping/state.json).", DefaultValue: "auto-ping/state.json"},
-			},
+			Name:             r.manifest.Metadata.Name,
+			Version:          r.manifest.Metadata.Version,
+			Author:           r.manifest.Metadata.Author,
+			GitHubRepository: r.manifest.Metadata.GitHubRepository,
+			Description:      r.manifest.Metadata.Description,
+			ConfigFields:     r.registrationFields(),
 		},
 		Capabilities: map[string]bool{"management_api": true, "scheduler": true},
 	}
+}
+
+func (r *Runtime) registrationFields() []configField {
+	fields := make([]configField, 0, len(r.manifest.Metadata.ConfigFields))
+	for _, field := range r.manifest.Metadata.ConfigFields {
+		value := r.manifest.Defaults.fieldValue(field.Name)
+		fields = append(fields, configField{
+			Name:         field.Name,
+			Type:         field.Type,
+			EnumValues:   field.EnumValues,
+			Description:  strings.TrimSuffix(field.Description, ".") + " (Default: " + formatDefaultHint(value) + ").",
+			DefaultValue: value,
+		})
+	}
+	return fields
+}
+
+func formatDefaultHint(value any) string {
+	switch typed := value.(type) {
+	case []string:
+		return "[" + strings.Join(typed, ", ") + "]"
+	case bool:
+		return strconv.FormatBool(typed)
+	case int:
+		return strconv.Itoa(typed)
+	case string:
+		return typed
+	}
+	return fmt.Sprintf("%v", value)
 }
 
 func lifecycleConfig(request []byte) ([]byte, error) {
@@ -202,6 +217,10 @@ func lifecycleConfig(request []byte) ([]byte, error) {
 	return []byte(text), nil
 }
 
+func (r *Runtime) routePath(suffix string) string {
+	return "/" + r.manifest.ID + suffix
+}
+
 func (r *Runtime) handleManagement(ctx context.Context, raw []byte) (managementResponse, error) {
 	var request managementRequest
 	if err := json.Unmarshal(raw, &request); err != nil {
@@ -209,9 +228,9 @@ func (r *Runtime) handleManagement(ctx context.Context, raw []byte) (managementR
 	}
 	path := strings.TrimSuffix(request.Path, "/")
 	switch {
-	case request.Method == http.MethodGet && strings.HasSuffix(path, "/auto-ping/status"):
+	case request.Method == http.MethodGet && strings.HasSuffix(path, r.routePath("/status")):
 		return jsonManagement(http.StatusOK, r.status()), nil
-	case request.Method == http.MethodGet && strings.HasSuffix(path, "/auto-ping/diagnostics"):
+	case request.Method == http.MethodGet && strings.HasSuffix(path, r.routePath("/diagnostics")):
 		return jsonManagement(http.StatusOK, diagnosticsPayload{
 			Status: r.status(),
 			RequiredHostCallbacks: []string{
@@ -224,7 +243,7 @@ func (r *Runtime) handleManagement(ctx context.Context, raw []byte) (managementR
 				"Exactly-once delivery is impossible without upstream idempotency; rare crash duplicates are accepted.",
 			},
 		}), nil
-	case request.Method == http.MethodPost && strings.HasSuffix(path, "/auto-ping/ping"):
+	case request.Method == http.MethodPost && strings.HasSuffix(path, r.routePath("/ping")):
 		var input ManualPingRequest
 		if err := json.Unmarshal(request.Body, &input); err != nil || strings.TrimSpace(input.CredentialID) == "" {
 			return jsonManagement(http.StatusBadRequest, map[string]string{"error": "credential_id is required"}), nil
@@ -257,8 +276,8 @@ func (r *Runtime) status() statusPayload {
 		accounts = store.Accounts()
 	}
 	return statusPayload{
-		Plugin:  pluginID,
-		Version: r.version,
+		Plugin:  r.manifest.ID,
+		Version: r.manifest.Metadata.Version,
 		AutoPing: statusConfig{
 			Enabled:                 cfg.AutoPingEnabled,
 			ScanInterval:            cfg.ScanInterval.String(),
