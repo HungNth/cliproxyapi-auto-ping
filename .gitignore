@@ -1,0 +1,7 @@
+dist/
+auto-ping/
+*.dll
+*.dylib
+*.so
+*.h
+*.exe
