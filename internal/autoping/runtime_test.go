@@ -36,12 +36,9 @@ func TestScannerHandlesMultipleAccountsOnceAndSurvivesRestart(t *testing.T) {
 	host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) { return successStream() }
 
 	startupDelay := 24 * time.Hour
-	cfg := DefaultConfig()
-	cfg.AutoPingEnabled = true
-	cfg.MaxConcurrency = 2
-	cfg.SchedulerBoostFallback = false
+	runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
+	cfg := testConfig(t, runtime, "auto_ping_enabled: true\nmax_concurrency: 2\nscheduler_boost_fallback: false\n")
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
-	runtime := NewRuntime(host, Options{Now: clock.Now, StartupDelay: &startupDelay})
 	if err := runtime.Configure(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +73,7 @@ func TestScannerHandlesMultipleAccountsOnceAndSurvivesRestart(t *testing.T) {
 	if err := runtime.Shutdown(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	restarted := NewRuntime(host, Options{Now: clock.Now, StartupDelay: &startupDelay})
+	restarted := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
 	if err := restarted.Configure(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -110,11 +107,9 @@ func TestScannerFailureCooldownThenRetrySuccess(t *testing.T) {
 	}
 
 	startupDelay := 24 * time.Hour
-	cfg := DefaultConfig()
-	cfg.AutoPingEnabled = true
-	cfg.SchedulerBoostFallback = false
+	runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
+	cfg := testConfig(t, runtime, "auto_ping_enabled: true\nscheduler_boost_fallback: false\n")
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
-	runtime := NewRuntime(host, Options{Now: clock.Now, StartupDelay: &startupDelay})
 	if err := runtime.Configure(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -173,11 +168,10 @@ func TestScannerSkipsDisabledAndMissingFiveHourWindow(t *testing.T) {
 		return HTTPStreamResponse{}, nil, nil
 	}
 
-	cfg := DefaultConfig()
-	cfg.AutoPingEnabled = true
-	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	startupDelay := 24 * time.Hour
-	runtime := NewRuntime(host, Options{Now: clock.Now, StartupDelay: &startupDelay})
+	runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
+	cfg := testConfig(t, runtime, "auto_ping_enabled: true\n")
+	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	if err := runtime.Configure(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -200,9 +194,9 @@ func TestManualPingDoesNotProcessBoundaryByDefault(t *testing.T) {
 	host.docs[file.AuthIndex] = document
 	host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) { return successStream() }
 
-	cfg := DefaultConfig()
+	runtime := newTestRuntime(t, host, Options{})
+	cfg := testConfig(t, runtime, "")
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
-	runtime := NewRuntime(host, Options{})
 	if err := runtime.Configure(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -224,9 +218,9 @@ func TestDisabledScannerSendsNoRequests(t *testing.T) {
 		t.Fatal("disabled scanner fetched quota")
 		return HTTPResponse{}, nil
 	}
-	cfg := DefaultConfig()
+	runtime := newTestRuntime(t, host, Options{})
+	cfg := testConfig(t, runtime, "")
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
-	runtime := NewRuntime(host, Options{})
 	if err := runtime.Configure(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}

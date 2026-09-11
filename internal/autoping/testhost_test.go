@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"testing"
 	"time"
 )
 
@@ -185,4 +186,22 @@ func credential(id, token string, priority int) (AuthFile, AuthDocument) {
 	file := AuthFile{ID: id, AuthIndex: authIndex, Name: id + ".json", Provider: "codex", Status: "active", Priority: priority}
 	data, _ := json.Marshal(map[string]any{"type": "codex", "access_token": token, "account_id": "account-" + id, "priority": priority})
 	return file, AuthDocument{AuthIndex: authIndex, Name: file.Name, JSON: data}
+}
+
+func newTestRuntime(t *testing.T, host Host, options Options) *Runtime {
+	t.Helper()
+	runtime, err := NewRuntime(host, []byte(testManifestYAML), options)
+	if err != nil {
+		t.Fatalf("construct runtime: %v", err)
+	}
+	return runtime
+}
+
+func testConfig(t *testing.T, runtime *Runtime, data string) Config {
+	t.Helper()
+	cfg, err := runtime.parseConfig([]byte(data))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	return cfg
 }

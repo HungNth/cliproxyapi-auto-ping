@@ -32,8 +32,8 @@ func TestDirectActivationTargetsCredentialAndFallsBackModelOnce(t *testing.T) {
 		}
 		return successStream()
 	}
-	runtime := NewRuntime(host, Options{})
-	result := runtime.activate(t.Context(), DefaultConfig(), file, AuthMaterial{AccessToken: "token-a", AccountID: "account-codex-a"})
+	runtime := newTestRuntime(t, host, Options{})
+	result := runtime.activate(t.Context(), testConfig(t, runtime, ""), file, AuthMaterial{AccessToken: "token-a", AccountID: "account-codex-a"})
 	if !result.Success || result.Model != "gpt-5.6-luna" || result.Transport != TransportDirectHTTP {
 		t.Fatalf("result = %#v", result)
 	}
@@ -54,8 +54,8 @@ func TestDirectBusinessFailureDoesNotUseSchedulerFallback(t *testing.T) {
 		t.Fatal("scheduler fallback must not run for authentication failure")
 		return ModelExecuteResponse{}, nil
 	}
-	runtime := NewRuntime(host, Options{})
-	result := runtime.activate(t.Context(), DefaultConfig(), file, AuthMaterial{AccessToken: "token-a"})
+	runtime := newTestRuntime(t, host, Options{})
+	result := runtime.activate(t.Context(), testConfig(t, runtime, ""), file, AuthMaterial{AccessToken: "token-a"})
 	if result.Failure != FailureAuth || len(host.modelRequests) != 0 {
 		t.Fatalf("result = %#v, model requests = %d", result, len(host.modelRequests))
 	}
@@ -72,7 +72,7 @@ func TestTransportFailureUsesConfirmedSchedulerFallback(t *testing.T) {
 		return HTTPStreamResponse{}, nil, errors.New("stream bridge unavailable")
 	}
 
-	runtime := NewRuntime(host, Options{})
+	runtime := newTestRuntime(t, host, Options{})
 	host.modelExecuteFunc = func(request ModelExecuteRequest) (ModelExecuteResponse, error) {
 		raw, _ := json.Marshal(schedulerRequest{
 			Candidates: []schedulerCandidate{{ID: "codex-a"}, {ID: "codex-b"}},
@@ -88,7 +88,7 @@ func TestTransportFailureUsesConfirmedSchedulerFallback(t *testing.T) {
 		return ModelExecuteResponse{StatusCode: http.StatusOK, Body: []byte(`{"id":"resp_fallback"}`)}, nil
 	}
 
-	result := runtime.activate(context.Background(), DefaultConfig(), target, AuthMaterial{AccessToken: "token-a"})
+	result := runtime.activate(context.Background(), testConfig(t, runtime, ""), target, AuthMaterial{AccessToken: "token-a"})
 	if !result.Success || result.Transport != TransportSchedulerBoost {
 		t.Fatalf("result = %#v", result)
 	}

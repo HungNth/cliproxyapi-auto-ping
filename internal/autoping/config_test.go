@@ -7,10 +7,8 @@ import (
 )
 
 func TestConfigDefaultsRequireExplicitOptIn(t *testing.T) {
-	cfg, err := ParseConfig(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := newTestRuntime(t, newFakeHost(), Options{})
+	cfg := testConfig(t, runtime, "")
 	if cfg.AutoPingEnabled {
 		t.Fatal("auto-ping must be disabled by default")
 	}
@@ -23,7 +21,8 @@ func TestConfigDefaultsRequireExplicitOptIn(t *testing.T) {
 }
 
 func TestConfigParsesFlatStandaloneShape(t *testing.T) {
-	cfg, err := ParseConfig([]byte(`
+	runtime := newTestRuntime(t, newFakeHost(), Options{})
+	cfg, err := runtime.parseConfig([]byte(`
 auto_ping_enabled: true
 scan_interval: 30s
 activation_delay: 7s
@@ -40,7 +39,6 @@ transport: direct_http
 scheduler_boost_fallback: false
 exclude_credentials:
   - codex-test
-state_path: data/auto-ping.json
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +52,8 @@ state_path: data/auto-ping.json
 }
 
 func TestConfigRejectsAutoWithoutCandidates(t *testing.T) {
-	_, err := ParseConfig([]byte("model: auto\nmodel_candidates: []\n"))
+	runtime := newTestRuntime(t, newFakeHost(), Options{})
+	_, err := runtime.parseConfig([]byte("model: auto\nmodel_candidates: []\n"))
 	if !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("error = %v, want ErrInvalidConfig", err)
 	}
