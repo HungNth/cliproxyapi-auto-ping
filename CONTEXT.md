@@ -35,3 +35,11 @@ _Avoid_: Every account, scheduler candidate
 **Processed Reset Boundary**:
 A Reset Boundary already handled by a successful Auto-Ping or confirmed External Activation and therefore not eligible again.
 _Avoid_: Attempted reset, failed ping
+
+**Plugin Manifest**:
+The canonical declaration of the plugin's identity, release metadata, and default runtime configuration.
+_Avoid_: Plugin config, release tag, hardcoded metadata
+
+**Plugin Instance Configuration**:
+Host-managed settings for one installed plugin instance. Explicit values override defaults declared by the Plugin Manifest.
+_Avoid_: Plugin Manifest, build metadata
