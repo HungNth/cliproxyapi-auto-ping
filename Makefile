@@ -1,7 +1,6 @@
-PLUGIN_NAME ?= auto-ping
-VERSION ?= 0.1.0
+PLUGIN_NAME ?= cliproxyapi-auto-ping
 BUILD_DIR ?= dist
-GO_LDFLAGS ?= -s -w -X main.pluginVersion=$(VERSION)
+GO_LDFLAGS ?= -s -w
 
 EXT_linux = so
 EXT_freebsd = so

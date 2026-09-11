@@ -66,14 +66,19 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           set -euo pipefail
+          MANIFEST_ID="$(sed -n 's/^id: *//p' plugin.yaml | tr -d '\"\r')"
+          if [[ "${MANIFEST_ID}" != "cliproxyapi-auto-ping" ]]; then
+            echo "::error::plugin.yaml id '${MANIFEST_ID}' does not match the cliproxyapi-auto-ping packaging contract"
+            exit 1
+          fi
           if [[ "${GOOS}-${GOARCH}" == "windows-arm64" ]]; then
             export CC=clang
           fi
           mkdir -p dist
-          CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o "dist/auto-ping.${{ matrix.ext }}" .
+          CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags "-s -w" -o "dist/cliproxyapi-auto-ping.${{ matrix.ext }}" .
           rm -f dist/*.h
       - uses: actions/upload-artifact@v4
         with:
-          name: auto-ping-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/auto-ping.${{ matrix.ext }}
+          name: cliproxyapi-auto-ping-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/cliproxyapi-auto-ping.${{ matrix.ext }}
           if-no-files-found: error
