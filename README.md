@@ -17,53 +17,46 @@ For every eligible Codex credential, the plugin:
 
 A successful request is recorded only after a valid Codex response stream completes. If the process crashes after upstream success but before the state write, one rare duplicate is possible; pre-marking the cycle was rejected because it could silently lose the activation.
 
-## Relationship to quota-activation
-
-| Plugin | Purpose |
-| --- | --- |
-| `quota-activation` | Existing long-window Codex/Antigravity activation |
-| `cliproxyapi-auto-ping` | Codex rolling five-hour window activation only |
-
 The plugins are independent and may be enabled together. This plugin does not modify `quota-activation` behavior or state.
 
 ## Configuration
 
-Auto-Ping has a second explicit safety switch. Both the host-owned `enabled` and plugin-owned `auto_ping_enabled` must be true.
+Auto-Ping has a second safety switch. The host-owned `enabled` and the plugin-owned `auto_ping_enabled` must both be true. A newly installed and enabled plugin starts with `auto_ping_enabled` already true, so no manual edit is required before it works.
 
 ```yaml
 plugins:
-  enabled: true
-  dir: "plugins"
-  configs:
-    cliproxyapi-auto-ping:
-      enabled: true
-      priority: 1
+    enabled: true
+    dir: "plugins"
+    configs:
+        cliproxyapi-auto-ping:
+            enabled: true
+            priority: 1
 
-      # Explicit opt-in. Default: false.
-      auto_ping_enabled: true
+            # Default: true. Set to false to opt out of background requests.
+            auto_ping_enabled: true
 
-      scan_interval: "1m"
-      activation_delay: "5s"
-      retry_cooldown: "15m"
-      max_concurrency: 1
-      request_timeout: "60s"
+            scan_interval: "1m"
+            activation_delay: "5s"
+            retry_cooldown: "15m"
+            max_concurrency: 1
+            request_timeout: "60s"
 
-      prompt: "ping"
-      max_output_tokens: 1
+            prompt: "ping"
+            max_output_tokens: 1
 
-      # auto tries candidates in order and advances only for a model-specific error.
-      model: "auto"
-      model_candidates:
-        - "gpt-5.5"
-        - "gpt-5.6-luna"
+            # auto tries candidates in order and advances only for a model-specific error.
+            model: "auto"
+            model_candidates:
+                - "gpt-5.5"
+                - "gpt-5.6-luna"
 
-      transport: "direct_http"
-      scheduler_boost_fallback: true
+            transport: "direct_http"
+            scheduler_boost_fallback: true
 
-      # Empty means every otherwise eligible Codex credential.
-      exclude_credentials: []
+            # Empty means every otherwise eligible Codex credential.
+            exclude_credentials: []
 
-      state_path: "cliproxyapi-auto-ping/state.json"
+            state_path: "cliproxyapi-auto-ping/state.json"
 ```
 
 An explicit model disables model fallback:
@@ -72,22 +65,24 @@ An explicit model disables model fallback:
 model: "gpt-5.5"
 ```
 
+An `auto_ping_enabled: false` you wrote yourself is preserved: re-enabling the plugin keeps the scanner stopped. Removing the key restores the default `true`.
+
 ### Defaults
 
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `auto_ping_enabled` | `false` | Prevents unexpected inference requests after installation |
-| `scan_interval` | `1m` | Quota observation frequency |
-| `activation_delay` | `5s` | Delay after a fixed reset boundary |
-| `retry_cooldown` | `15m` | Delay after retryable activation failure |
-| `max_concurrency` | `1` | Maximum credentials processed concurrently |
-| `request_timeout` | `60s` | Quota/inference operation timeout |
-| `prompt` | `ping` | Minimal user input |
-| `max_output_tokens` | `1` | Maximum generated tokens |
-| `model` | `auto` | Uses `model_candidates` |
-| `transport` | `direct_http` | Guarantees the intended credential is used |
-| `scheduler_boost_fallback` | `true` | Fallback only for host/transport failures |
-| `state_path` | `cliproxyapi-auto-ping/state.json` | Persistent state location |
+| Field                      | Default                            | Meaning                                                   |
+| -------------------------- | ---------------------------------- | --------------------------------------------------------- |
+| `auto_ping_enabled`        | `true`                             | Set to `false` to opt out of background inference requests |
+| `scan_interval`            | `1m`                               | Quota observation frequency                               |
+| `activation_delay`         | `5s`                               | Delay after a fixed reset boundary                        |
+| `retry_cooldown`           | `15m`                              | Delay after retryable activation failure                  |
+| `max_concurrency`          | `1`                                | Maximum credentials processed concurrently                |
+| `request_timeout`          | `60s`                              | Quota/inference operation timeout                         |
+| `prompt`                   | `ping`                             | Minimal user input                                        |
+| `max_output_tokens`        | `1`                                | Maximum generated tokens                                  |
+| `model`                    | `auto`                             | Uses `model_candidates`                                   |
+| `transport`                | `direct_http`                      | Guarantees the intended credential is used                |
+| `scheduler_boost_fallback` | `true`                             | Fallback only for host/transport failures                 |
+| `state_path`               | `cliproxyapi-auto-ping/state.json` | Persistent state location                                 |
 
 ## Eligibility and failure handling
 
@@ -116,9 +111,9 @@ Manual ping body:
 
 ```json
 {
-  "credential_id": "codex-account-a",
-  "model": "gpt-5.5",
-  "mark_cycle_processed": false
+    "credential_id": "codex-account-a",
+    "model": "gpt-5.5",
+    "mark_cycle_processed": false
 }
 ```
 
@@ -162,9 +157,7 @@ The plugin runs in-process and can read CLIProxyAPI-managed Codex credentials. I
 ## References
 
 - [CLIProxyAPI plugin development](https://help.router-for.me/plugin/development.html)
-- [KKKKeybird/cpa-codex-auto-ping](https://github.com/KKKKeybird/cpa-codex-auto-ping) — basic timer/plugin ABI reference
-- [Cody292/quota-activation](https://github.com/Cody292/quota-activation) — credential targeting, state, and fallback reference
-- [decolua/9router](https://github.com/decolua/9router) — Codex usage and sliding-window behavior reference
+- [Cody292/quota-activation](https://github.com/Cody292/
 
 ## License
 
