@@ -69,20 +69,20 @@ An `auto_ping_enabled: false` you wrote yourself is preserved: re-enabling the p
 
 ### Defaults
 
-| Field                      | Default                            | Meaning                                                   |
-| -------------------------- | ---------------------------------- | --------------------------------------------------------- |
+| Field                      | Default                            | Meaning                                                    |
+| -------------------------- | ---------------------------------- | ---------------------------------------------------------- |
 | `auto_ping_enabled`        | `true`                             | Set to `false` to opt out of background inference requests |
-| `scan_interval`            | `1m`                               | Quota observation frequency                               |
-| `activation_delay`         | `5s`                               | Delay after a fixed reset boundary                        |
-| `retry_cooldown`           | `15m`                              | Delay after retryable activation failure                  |
-| `max_concurrency`          | `1`                                | Maximum credentials processed concurrently                |
-| `request_timeout`          | `60s`                              | Quota/inference operation timeout                         |
-| `prompt`                   | `ping`                             | Minimal user input                                        |
-| `max_output_tokens`        | `1`                                | Maximum generated tokens                                  |
-| `model`                    | `auto`                             | Uses `model_candidates`                                   |
-| `transport`                | `direct_http`                      | Guarantees the intended credential is used                |
-| `scheduler_boost_fallback` | `true`                             | Fallback only for host/transport failures                 |
-| `state_path`               | `cliproxyapi-auto-ping/state.json` | Persistent state location                                 |
+| `scan_interval`            | `1m`                               | Quota observation frequency                                |
+| `activation_delay`         | `5s`                               | Delay after a fixed reset boundary                         |
+| `retry_cooldown`           | `15m`                              | Delay after retryable activation failure                   |
+| `max_concurrency`          | `1`                                | Maximum credentials processed concurrently                 |
+| `request_timeout`          | `60s`                              | Quota/inference operation timeout                          |
+| `prompt`                   | `ping`                             | Minimal user input                                         |
+| `max_output_tokens`        | `1`                                | Maximum generated tokens                                   |
+| `model`                    | `auto`                             | Uses `model_candidates`                                    |
+| `transport`                | `direct_http`                      | Guarantees the intended credential is used                 |
+| `scheduler_boost_fallback` | `true`                             | Fallback only for host/transport failures                  |
+| `state_path`               | `cliproxyapi-auto-ping/state.json` | Persistent state location                                  |
 
 ## Eligibility and failure handling
 
@@ -157,7 +157,7 @@ The plugin runs in-process and can read CLIProxyAPI-managed Codex credentials. I
 ## References
 
 - [CLIProxyAPI plugin development](https://help.router-for.me/plugin/development.html)
-- [Cody292/quota-activation](https://github.com/Cody292/
+- [Cody292/quota-activation](https://github.com/Cody292/quota-activation)
 
 ## License
 
