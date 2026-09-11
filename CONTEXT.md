@@ -43,3 +43,11 @@ _Avoid_: Plugin config, release tag, hardcoded metadata
 **Plugin Instance Configuration**:
 Host-managed settings for one installed plugin instance. Explicit values override defaults declared by the Plugin Manifest.
 _Avoid_: Plugin Manifest, build metadata
+
+**Initial Plugin Configuration**:
+The Plugin Instance Configuration established when an installed plugin is first enabled. An omitted Auto-Ping setting inherits the Plugin Manifest default.
+_Avoid_: Re-activation, configuration migration
+
+**Explicit Auto-Ping Opt-Out**:
+A Plugin Instance Configuration that sets Auto-Ping to disabled. Later activation does not replace this choice.
+_Avoid_: Missing setting, temporary scanner stop
