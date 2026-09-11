@@ -6,11 +6,11 @@ import (
 	"time"
 )
 
-func TestConfigDefaultsRequireExplicitOptIn(t *testing.T) {
+func TestConfigDefaultsEnableAutoPing(t *testing.T) {
 	runtime := newTestRuntime(t, newFakeHost(), Options{})
 	cfg := testConfig(t, runtime, "")
-	if cfg.AutoPingEnabled {
-		t.Fatal("auto-ping must be disabled by default")
+	if !cfg.AutoPingEnabled {
+		t.Fatal("auto-ping must be enabled by default")
 	}
 	if cfg.ScanInterval != time.Minute || cfg.Model != "auto" {
 		t.Fatalf("unexpected defaults: %#v", cfg)

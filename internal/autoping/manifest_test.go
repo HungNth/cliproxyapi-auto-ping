@@ -20,7 +20,7 @@ metadata:
   config_fields:
     - name: auto_ping_enabled
       type: boolean
-      description: "Explicit opt-in for background Codex inference requests."
+      description: "Set to false to disable background Codex inference requests."
     - name: scan_interval
       type: string
       description: "Quota scan interval as a Go duration, for example 1m, 30s."
@@ -62,7 +62,7 @@ metadata:
       type: string
       description: "Path to the persistent state JSON file."
 defaults:
-  auto_ping_enabled: false
+  auto_ping_enabled: true
   scan_interval: "1m"
   activation_delay: "5s"
   retry_cooldown: "15m"
@@ -111,7 +111,7 @@ func TestParseManifestAcceptsCanonicalDocument(t *testing.T) {
 		t.Fatalf("config fields = %d, want 14", len(manifest.Metadata.ConfigFields))
 	}
 	defaults := manifest.Defaults
-	if defaults.AutoPingEnabled || defaults.ScanInterval != time.Minute || defaults.Model != "auto" {
+	if !defaults.AutoPingEnabled || defaults.ScanInterval != time.Minute || defaults.Model != "auto" {
 		t.Fatalf("defaults = %#v", defaults)
 	}
 	if got := defaults.Models(); !slices.Equal(got, []string{"gpt-5.5", "gpt-5.6-luna"}) {
@@ -199,7 +199,7 @@ func TestRegistrationServesManifestMetadata(t *testing.T) {
 		byName[field.Name] = field
 	}
 	enabled := byName["auto_ping_enabled"]
-	if enabled.DefaultValue != false || enabled.Description != "Explicit opt-in for background Codex inference requests (Default: false)." {
+	if enabled.DefaultValue != true || enabled.Description != "Set to false to disable background Codex inference requests (Default: true)." {
 		t.Fatalf("auto_ping_enabled = %#v", enabled)
 	}
 	candidates := byName["model_candidates"]
@@ -219,8 +219,12 @@ func TestRegistrationServesManifestMetadata(t *testing.T) {
 func TestInstanceConfigurationOverridesManifestDefaults(t *testing.T) {
 	runtime := newTestRuntime(t, newFakeHost(), Options{})
 	cfg := testConfig(t, runtime, "")
-	if cfg.ScanInterval != time.Minute || cfg.AutoPingEnabled {
+	if cfg.ScanInterval != time.Minute || !cfg.AutoPingEnabled {
 		t.Fatalf("omitted settings must inherit manifest defaults: %#v", cfg)
+	}
+	cfg = testConfig(t, runtime, "auto_ping_enabled: false\n")
+	if cfg.AutoPingEnabled {
+		t.Fatalf("explicit opt-out must override manifest defaults: %#v", cfg)
 	}
 	cfg = testConfig(t, runtime, "scan_interval: 30s\nmodel: gpt-9\n")
 	if cfg.ScanInterval != 30*time.Second || cfg.Model != "gpt-9" || !slices.Equal(cfg.Models(), []string{"gpt-9"}) {

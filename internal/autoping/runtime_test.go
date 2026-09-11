@@ -195,7 +195,7 @@ func TestManualPingDoesNotProcessBoundaryByDefault(t *testing.T) {
 	host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) { return successStream() }
 
 	runtime := newTestRuntime(t, host, Options{})
-	cfg := testConfig(t, runtime, "")
+	cfg := testConfig(t, runtime, "auto_ping_enabled: false\n")
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	if err := runtime.Configure(t.Context(), cfg); err != nil {
 		t.Fatal(err)
@@ -219,7 +219,7 @@ func TestDisabledScannerSendsNoRequests(t *testing.T) {
 		return HTTPResponse{}, nil
 	}
 	runtime := newTestRuntime(t, host, Options{})
-	cfg := testConfig(t, runtime, "")
+	cfg := testConfig(t, runtime, "auto_ping_enabled: false\n")
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	if err := runtime.Configure(t.Context(), cfg); err != nil {
 		t.Fatal(err)
