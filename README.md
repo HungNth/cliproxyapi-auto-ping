@@ -22,7 +22,7 @@ A successful request is recorded only after a valid Codex response stream comple
 | Plugin | Purpose |
 | --- | --- |
 | `quota-activation` | Existing long-window Codex/Antigravity activation |
-| `auto-ping` | Codex rolling five-hour window activation only |
+| `cliproxyapi-auto-ping` | Codex rolling five-hour window activation only |
 
 The plugins are independent and may be enabled together. This plugin does not modify `quota-activation` behavior or state.
 
@@ -35,7 +35,7 @@ plugins:
   enabled: true
   dir: "plugins"
   configs:
-    auto-ping:
+    cliproxyapi-auto-ping:
       enabled: true
       priority: 1
 
@@ -63,7 +63,7 @@ plugins:
       # Empty means every otherwise eligible Codex credential.
       exclude_credentials: []
 
-      state_path: "auto-ping/state.json"
+      state_path: "cliproxyapi-auto-ping/state.json"
 ```
 
 An explicit model disables model fallback:
@@ -87,7 +87,7 @@ model: "gpt-5.5"
 | `model` | `auto` | Uses `model_candidates` |
 | `transport` | `direct_http` | Guarantees the intended credential is used |
 | `scheduler_boost_fallback` | `true` | Fallback only for host/transport failures |
-| `state_path` | `auto-ping/state.json` | Persistent state location |
+| `state_path` | `cliproxyapi-auto-ping/state.json` | Persistent state location |
 
 ## Eligibility and failure handling
 
@@ -107,9 +107,9 @@ The scanner skips credentials that are disabled, unavailable, revoked, excluded,
 All routes are registered under `/v0/management` and therefore require CLIProxyAPI management authentication. The plugin exposes no unauthenticated resource page.
 
 ```text
-GET  /v0/management/auto-ping/status
-GET  /v0/management/auto-ping/diagnostics
-POST /v0/management/auto-ping/ping
+GET  /v0/management/cliproxyapi-auto-ping/status
+GET  /v0/management/cliproxyapi-auto-ping/diagnostics
+POST /v0/management/cliproxyapi-auto-ping/ping
 ```
 
 Manual ping body:
@@ -130,6 +130,8 @@ Status and diagnostics expose credential IDs, reset timestamps, decisions, count
 
 Go 1.26+ and a C compiler are required because CLIProxyAPI plugins use `-buildmode=c-shared`.
 
+Plugin identity, configuration field descriptors, and runtime defaults come from the canonical `plugin.yaml` at the repository root, embedded into the shared library at build time. The manifest version is authoritative: release tags must match it (`v0.1.0` for version `0.1.0`), and the plugin ID must stay `cliproxyapi-auto-ping` because it names the artifact, host configuration key, and management routes.
+
 ```bash
 make test
 make build
@@ -138,20 +140,20 @@ make build
 Equivalent command on Linux:
 
 ```bash
-CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o dist/auto-ping.so .
+CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o dist/cliproxyapi-auto-ping.so .
 ```
 
 Extensions are `.so` on Linux, `.dylib` on macOS, and `.dll` on Windows. Install the library in a CLIProxyAPI discovery path, for example:
 
 ```text
-plugins/linux/amd64/auto-ping.so
-plugins/windows/amd64/auto-ping.dll
-plugins/darwin/arm64/auto-ping.dylib
+plugins/linux/amd64/cliproxyapi-auto-ping.so
+plugins/windows/amd64/cliproxyapi-auto-ping.dll
+plugins/darwin/arm64/cliproxyapi-auto-ping.dylib
 ```
 
 Then enable the plugin configuration and restart or reload CLIProxyAPI. Confirm `registered: true` and `effective_enabled: true` through `GET /v0/management/plugins`.
 
-GitHub Actions builds Linux, macOS, and Windows release assets for amd64 and arm64. Release ZIP files contain `auto-ping.<ext>` at the archive root and are accompanied by `checksums.txt`, matching CLIProxyAPI plugin-store installation format.
+GitHub Actions builds Linux, macOS, and Windows release assets for amd64 and arm64. Release ZIP files are named `cliproxyapi-auto-ping_<version>_<os>_<arch>.zip`, contain `cliproxyapi-auto-ping.<ext>` at the archive root, and are accompanied by `checksums.txt`, matching CLIProxyAPI plugin-store installation format.
 
 ## Security
 
