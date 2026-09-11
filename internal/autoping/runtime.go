@@ -1,7 +1,6 @@
 package autoping
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -16,13 +15,12 @@ const scannerStartupDelay = 3 * time.Second
 type Options struct {
 	Now          func() time.Time
 	StartupDelay *time.Duration
-	Version      string
 }
 
 type Runtime struct {
-	host    Host
-	now     func() time.Time
-	version string
+	host     Host
+	now      func() time.Time
+	manifest Manifest
 
 	mu            sync.RWMutex
 	config        Config
@@ -41,7 +39,11 @@ type Runtime struct {
 	startupDelay time.Duration
 }
 
-func NewRuntime(host Host, options Options) *Runtime {
+func NewRuntime(host Host, manifestData []byte, options Options) (*Runtime, error) {
+	manifest, err := ParseManifest(manifestData)
+	if err != nil {
+		return nil, err
+	}
 	now := options.Now
 	if now == nil {
 		now = time.Now
@@ -53,11 +55,11 @@ func NewRuntime(host Host, options Options) *Runtime {
 	return &Runtime{
 		host:         host,
 		now:          now,
-		version:      cmp.Or(strings.TrimSpace(options.Version), "0.1.0"),
-		config:       DefaultConfig(),
+		manifest:     manifest,
+		config:       manifest.Defaults,
 		sessions:     map[string]*fallbackSession{},
 		startupDelay: startupDelay,
-	}
+	}, nil
 }
 
 func (r *Runtime) Configure(ctx context.Context, cfg Config) error {

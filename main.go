@@ -82,11 +82,9 @@ import (
 	"github.com/HungNth/cliproxyapi-auto-ping/internal/autoping"
 )
 
-var pluginVersion = "0.1.0"
-
 var (
 	runtimeMu  sync.RWMutex
-	cpaRuntime = autoping.NewRuntime(nil, autoping.Options{Version: pluginVersion})
+	cpaRuntime *autoping.Runtime
 )
 
 func main() {}
@@ -97,8 +95,12 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 		return -1
 	}
 	C.store_auto_ping_host_api(host)
+	runtime, err := autoping.NewRuntime(hostCallbackAdapter{}, pluginManifest, autoping.Options{})
+	if err != nil {
+		return -1
+	}
 	runtimeMu.Lock()
-	cpaRuntime = autoping.NewRuntime(hostCallbackAdapter{}, autoping.Options{Version: pluginVersion})
+	cpaRuntime = runtime
 	runtimeMu.Unlock()
 	C.set_auto_ping_plugin_api(plugin)
 	return 0
@@ -120,6 +122,9 @@ func autoPingPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	runtimeMu.RLock()
 	current := cpaRuntime
 	runtimeMu.RUnlock()
+	if current == nil {
+		return writeResponse(response, []byte(`{"ok":false,"error":{"code":"not_initialized","message":"plugin runtime is not initialized"}}`))
+	}
 	return writeResponse(response, current.Handle(context.Background(), methodName, requestBytes))
 }
 

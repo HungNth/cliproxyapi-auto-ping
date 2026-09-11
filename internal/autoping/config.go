@@ -51,36 +51,12 @@ type rawConfig struct {
 	StatePath              *string  `yaml:"state_path"`
 }
 
-func DefaultConfig() Config {
-	return Config{
-		AutoPingEnabled:        false,
-		ScanInterval:           time.Minute,
-		ActivationDelay:        5 * time.Second,
-		RetryCooldown:          15 * time.Minute,
-		MaxConcurrency:         1,
-		RequestTimeout:         time.Minute,
-		Prompt:                 "ping",
-		MaxOutputTokens:        1,
-		Model:                  "auto",
-		ModelCandidates:        []string{"gpt-5.5", "gpt-5.6-luna"},
-		Transport:              TransportDirectHTTP,
-		SchedulerBoostFallback: true,
-		StatePath:              "auto-ping/state.json",
-	}
-}
-
-func ParseConfig(data []byte) (Config, error) {
-	cfg := DefaultConfig()
-	if len(strings.TrimSpace(string(data))) == 0 {
-		return cfg, nil
-	}
-
-	var raw rawConfig
-	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return Config{}, fmt.Errorf("%w: decode YAML: %v", ErrInvalidConfig, err)
-	}
+func configFromRaw(raw rawConfig, base Config, requireComplete bool) (Config, error) {
+	cfg := base
 	if raw.AutoPingEnabled != nil {
 		cfg.AutoPingEnabled = *raw.AutoPingEnabled
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set auto_ping_enabled", ErrInvalidConfig)
 	}
 	if raw.ScanInterval != "" {
 		parsed, err := positiveDuration("scan_interval", raw.ScanInterval)
@@ -88,6 +64,8 @@ func ParseConfig(data []byte) (Config, error) {
 			return Config{}, err
 		}
 		cfg.ScanInterval = parsed
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set scan_interval", ErrInvalidConfig)
 	}
 	if raw.ActivationDelay != "" {
 		parsed, err := nonNegativeDuration("activation_delay", raw.ActivationDelay)
@@ -95,6 +73,8 @@ func ParseConfig(data []byte) (Config, error) {
 			return Config{}, err
 		}
 		cfg.ActivationDelay = parsed
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set activation_delay", ErrInvalidConfig)
 	}
 	if raw.RetryCooldown != "" {
 		parsed, err := positiveDuration("retry_cooldown", raw.RetryCooldown)
@@ -102,6 +82,8 @@ func ParseConfig(data []byte) (Config, error) {
 			return Config{}, err
 		}
 		cfg.RetryCooldown = parsed
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set retry_cooldown", ErrInvalidConfig)
 	}
 	if raw.RequestTimeout != "" {
 		parsed, err := positiveDuration("request_timeout", raw.RequestTimeout)
@@ -109,51 +91,71 @@ func ParseConfig(data []byte) (Config, error) {
 			return Config{}, err
 		}
 		cfg.RequestTimeout = parsed
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set request_timeout", ErrInvalidConfig)
 	}
 	if raw.MaxConcurrency != nil {
 		cfg.MaxConcurrency = *raw.MaxConcurrency
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set max_concurrency", ErrInvalidConfig)
 	}
 	if cfg.MaxConcurrency < 1 || cfg.MaxConcurrency > 64 {
 		return Config{}, fmt.Errorf("%w: max_concurrency must be between 1 and 64", ErrInvalidConfig)
 	}
 	if raw.Prompt != nil {
 		cfg.Prompt = strings.TrimSpace(*raw.Prompt)
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set prompt", ErrInvalidConfig)
 	}
 	if cfg.Prompt == "" {
 		return Config{}, fmt.Errorf("%w: prompt must not be empty", ErrInvalidConfig)
 	}
 	if raw.MaxOutputTokens != nil {
 		cfg.MaxOutputTokens = *raw.MaxOutputTokens
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set max_output_tokens", ErrInvalidConfig)
 	}
 	if cfg.MaxOutputTokens < 1 || cfg.MaxOutputTokens > 16 {
 		return Config{}, fmt.Errorf("%w: max_output_tokens must be between 1 and 16", ErrInvalidConfig)
 	}
 	if raw.Model != nil {
 		cfg.Model = strings.TrimSpace(*raw.Model)
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set model", ErrInvalidConfig)
 	}
 	if cfg.Model == "" {
 		return Config{}, fmt.Errorf("%w: model must not be empty", ErrInvalidConfig)
 	}
 	if raw.ModelCandidates != nil {
 		cfg.ModelCandidates = uniqueStrings(raw.ModelCandidates)
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set model_candidates", ErrInvalidConfig)
 	}
 	if cfg.Model == "auto" && len(cfg.ModelCandidates) == 0 {
 		return Config{}, fmt.Errorf("%w: model_candidates must not be empty when model is auto", ErrInvalidConfig)
 	}
 	if raw.Transport != nil {
 		cfg.Transport = strings.TrimSpace(*raw.Transport)
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set transport", ErrInvalidConfig)
 	}
 	if cfg.Transport != TransportDirectHTTP && cfg.Transport != TransportSchedulerBoost {
 		return Config{}, fmt.Errorf("%w: transport must be %q or %q", ErrInvalidConfig, TransportDirectHTTP, TransportSchedulerBoost)
 	}
 	if raw.SchedulerBoostFallback != nil {
 		cfg.SchedulerBoostFallback = *raw.SchedulerBoostFallback
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set scheduler_boost_fallback", ErrInvalidConfig)
 	}
 	if raw.ExcludeCredentials != nil {
 		cfg.ExcludeCredentials = uniqueStrings(raw.ExcludeCredentials)
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set exclude_credentials", ErrInvalidConfig)
 	}
 	if raw.StatePath != nil {
 		cfg.StatePath = strings.TrimSpace(*raw.StatePath)
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set state_path", ErrInvalidConfig)
 	}
 	if cfg.StatePath == "" {
 		return Config{}, fmt.Errorf("%w: state_path must not be empty", ErrInvalidConfig)
@@ -161,11 +163,55 @@ func ParseConfig(data []byte) (Config, error) {
 	return cfg, nil
 }
 
+func (r *Runtime) parseConfig(data []byte) (Config, error) {
+	var raw rawConfig
+	if len(strings.TrimSpace(string(data))) != 0 {
+		if err := yaml.Unmarshal(data, &raw); err != nil {
+			return Config{}, fmt.Errorf("%w: decode YAML: %v", ErrInvalidConfig, err)
+		}
+	}
+	return configFromRaw(raw, r.manifest.Defaults, false)
+}
+
 func (c Config) Models() []string {
 	if c.Model != "auto" {
 		return []string{c.Model}
 	}
 	return slices.Clone(c.ModelCandidates)
+}
+
+func (c Config) fieldValue(name string) any {
+	switch name {
+	case "auto_ping_enabled":
+		return c.AutoPingEnabled
+	case "scan_interval":
+		return c.ScanInterval.String()
+	case "activation_delay":
+		return c.ActivationDelay.String()
+	case "retry_cooldown":
+		return c.RetryCooldown.String()
+	case "max_concurrency":
+		return c.MaxConcurrency
+	case "request_timeout":
+		return c.RequestTimeout.String()
+	case "prompt":
+		return c.Prompt
+	case "max_output_tokens":
+		return c.MaxOutputTokens
+	case "model":
+		return c.Model
+	case "model_candidates":
+		return slices.Clone(c.ModelCandidates)
+	case "transport":
+		return c.Transport
+	case "scheduler_boost_fallback":
+		return c.SchedulerBoostFallback
+	case "exclude_credentials":
+		return slices.Clone(c.ExcludeCredentials)
+	case "state_path":
+		return c.StatePath
+	}
+	return nil
 }
 
 func (c Config) Excludes(credentialID string) bool {
