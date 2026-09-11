@@ -19,6 +19,16 @@ func TestEmbeddedManifestMatchesPackagingContract(t *testing.T) {
 		t.Fatal("manifest version is empty")
 	}
 	if !manifest.Defaults.AutoPingEnabled {
-		t.Fatal("shipped auto_ping_enabled default must be true so a newly enabled plugin starts pinging")
+		t.Fatal("shipped auto_ping_disabled default must be false so a newly enabled plugin starts pinging")
+	}
+	foundDisabledField := false
+	for _, f := range manifest.Metadata.ConfigFields {
+		if f.Name == "auto_ping_disabled" {
+			foundDisabledField = true
+			break
+		}
+	}
+	if !foundDisabledField {
+		t.Fatal("manifest must declare auto_ping_disabled config field")
 	}
 }

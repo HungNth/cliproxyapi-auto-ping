@@ -1,6 +1,6 @@
 # Auto-Ping enabled by default
 
-Status: accepted (supersedes [ADR 0003](0003-require-explicit-auto-ping-opt-in.md))
+Status: superseded by [ADR 0008](0008-negative-boolean-auto-ping-disabled.md)
 
 A freshly installed plugin that is enabled starts with `auto_ping_enabled: true`, so no manual configuration edit is required before the scanner runs. ADR 0003 required an explicit `auto_ping_enabled: true` on top of the host-owned `enabled` switch; that second opt-in is dropped because the operator already performs an explicit, host-owned enablement and the plugin manifest is the single source of defaults (ADR 0006).
 

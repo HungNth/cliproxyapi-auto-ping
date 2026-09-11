@@ -35,7 +35,7 @@ type Config struct {
 }
 
 type rawConfig struct {
-	AutoPingEnabled        *bool    `yaml:"auto_ping_enabled"`
+	AutoPingDisabled       *bool    `yaml:"auto_ping_disabled"`
 	ScanInterval           string   `yaml:"scan_interval"`
 	ActivationDelay        string   `yaml:"activation_delay"`
 	RetryCooldown          string   `yaml:"retry_cooldown"`
@@ -53,10 +53,10 @@ type rawConfig struct {
 
 func configFromRaw(raw rawConfig, base Config, requireComplete bool) (Config, error) {
 	cfg := base
-	if raw.AutoPingEnabled != nil {
-		cfg.AutoPingEnabled = *raw.AutoPingEnabled
+	if raw.AutoPingDisabled != nil {
+		cfg.AutoPingEnabled = !*raw.AutoPingDisabled
 	} else if requireComplete {
-		return Config{}, fmt.Errorf("%w: manifest defaults must set auto_ping_enabled", ErrInvalidConfig)
+		return Config{}, fmt.Errorf("%w: manifest defaults must set auto_ping_disabled", ErrInvalidConfig)
 	}
 	if raw.ScanInterval != "" {
 		parsed, err := positiveDuration("scan_interval", raw.ScanInterval)
@@ -182,8 +182,8 @@ func (c Config) Models() []string {
 
 func (c Config) fieldValue(name string) any {
 	switch name {
-	case "auto_ping_enabled":
-		return c.AutoPingEnabled
+	case "auto_ping_disabled":
+		return !c.AutoPingEnabled
 	case "scan_interval":
 		return c.ScanInterval.String()
 	case "activation_delay":

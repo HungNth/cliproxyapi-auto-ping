@@ -18,9 +18,9 @@ metadata:
   github_repository: "https://github.com/HungNth/cliproxyapi-auto-ping"
   description: "Starts inactive Codex rolling five-hour windows with one minimal targeted request."
   config_fields:
-    - name: auto_ping_enabled
+    - name: auto_ping_disabled
       type: boolean
-      description: "Set to false to disable background Codex inference requests."
+      description: "Set to true to disable background Codex inference requests."
     - name: scan_interval
       type: string
       description: "Quota scan interval as a Go duration, for example 1m, 30s."
@@ -62,7 +62,7 @@ metadata:
       type: string
       description: "Path to the persistent state JSON file."
 defaults:
-  auto_ping_enabled: true
+  auto_ping_disabled: false
   scan_interval: "1m"
   activation_delay: "5s"
   retry_cooldown: "15m"
@@ -135,13 +135,15 @@ func TestParseManifestRejectsInvalidDocuments(t *testing.T) {
 		{name: "empty id", edits: []string{"id: cliproxyapi-auto-ping=>id: \"\""}, sentinel: ErrInvalidManifest},
 		{name: "missing metadata name", edits: []string{"  name: \"Codex 5h Auto-Ping\"\n=>"}, sentinel: ErrInvalidManifest},
 		{name: "missing config field", edits: []string{"    - name: prompt\n      type: string\n      description: \"Minimal prompt text sent to Codex.\"\n=>"}, sentinel: ErrInvalidManifest},
+		{name: "missing auto_ping_disabled config field", edits: []string{"    - name: auto_ping_disabled\n      type: boolean\n      description: \"Set to true to disable background Codex inference requests.\"\n=>"}, sentinel: ErrInvalidManifest},
 		{name: "duplicate config field", edits: []string{"    - name: state_path=>    - name: prompt\n      type: string\n      description: \"Duplicate prompt field.\"\n    - name: state_path"}, sentinel: ErrInvalidManifest},
 		{name: "unsupported config field", edits: []string{"    - name: prompt=>    - name: bogus_field"}, sentinel: ErrInvalidManifest},
-		{name: "wrong config field type", edits: []string{"    - name: auto_ping_enabled\n      type: boolean=>    - name: auto_ping_enabled\n      type: string"}, sentinel: ErrInvalidManifest},
+		{name: "wrong config field type", edits: []string{"    - name: auto_ping_disabled\n      type: boolean=>    - name: auto_ping_disabled\n      type: string"}, sentinel: ErrInvalidManifest},
 		{name: "incomplete transport enum", edits: []string{"      enum_values: [\"direct_http\", \"scheduler_boost\"]=>      enum_values: [\"direct_http\"]"}, sentinel: ErrInvalidManifest},
 		{name: "enum on non-enum field", edits: []string{"    - name: model_candidates\n      type: array=>    - name: model_candidates\n      type: array\n      enum_values: [\"x\"]"}, sentinel: ErrInvalidManifest},
 		{name: "empty field description", edits: []string{"      description: \"Minimal prompt text sent to Codex.\"=>      description: \"\""}, sentinel: ErrInvalidManifest},
 		{name: "missing default key", edits: []string{"  max_concurrency: 1\n=>"}, sentinel: ErrInvalidConfig},
+		{name: "missing auto_ping_disabled default", edits: []string{"  auto_ping_disabled: false\n=>"}, sentinel: ErrInvalidConfig},
 		{name: "invalid default duration", edits: []string{"  scan_interval: \"1m\"=>  scan_interval: \"0s\""}, sentinel: ErrInvalidConfig},
 		{name: "invalid default concurrency", edits: []string{"  max_concurrency: 1=>  max_concurrency: 0"}, sentinel: ErrInvalidConfig},
 		{name: "auto default without candidates", edits: []string{"  model_candidates: [\"gpt-5.5\", \"gpt-5.6-luna\"]=>  model_candidates: []"}, sentinel: ErrInvalidConfig},
@@ -198,9 +200,9 @@ func TestRegistrationServesManifestMetadata(t *testing.T) {
 	for _, field := range metadata.ConfigFields {
 		byName[field.Name] = field
 	}
-	enabled := byName["auto_ping_enabled"]
-	if enabled.DefaultValue != true || enabled.Description != "Set to false to disable background Codex inference requests (Default: true)." {
-		t.Fatalf("auto_ping_enabled = %#v", enabled)
+	disabled := byName["auto_ping_disabled"]
+	if disabled.DefaultValue != false || disabled.Description != "Set to true to disable background Codex inference requests (Default: false)." {
+		t.Fatalf("auto_ping_disabled = %#v", disabled)
 	}
 	candidates := byName["model_candidates"]
 	values, ok := candidates.DefaultValue.([]any)
@@ -222,9 +224,13 @@ func TestInstanceConfigurationOverridesManifestDefaults(t *testing.T) {
 	if cfg.ScanInterval != time.Minute || !cfg.AutoPingEnabled {
 		t.Fatalf("omitted settings must inherit manifest defaults: %#v", cfg)
 	}
-	cfg = testConfig(t, runtime, "auto_ping_enabled: false\n")
+	cfg = testConfig(t, runtime, "auto_ping_disabled: true\n")
 	if cfg.AutoPingEnabled {
 		t.Fatalf("explicit opt-out must override manifest defaults: %#v", cfg)
+	}
+	cfg = testConfig(t, runtime, "auto_ping_disabled: false\n")
+	if !cfg.AutoPingEnabled {
+		t.Fatalf("explicit false must preserve auto-ping enabled: %#v", cfg)
 	}
 	cfg = testConfig(t, runtime, "scan_interval: 30s\nmodel: gpt-9\n")
 	if cfg.ScanInterval != 30*time.Second || cfg.Model != "gpt-9" || !slices.Equal(cfg.Models(), []string{"gpt-9"}) {

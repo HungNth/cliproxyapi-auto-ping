@@ -21,7 +21,7 @@ The plugins are independent and may be enabled together. This plugin does not mo
 
 ## Configuration
 
-Auto-Ping has a second safety switch. The host-owned `enabled` and the plugin-owned `auto_ping_enabled` must both be true. A newly installed and enabled plugin starts with `auto_ping_enabled` already true, so no manual edit is required before it works.
+Auto-Ping has a dedicated opt-out switch. The plugin starts with `auto_ping_disabled: false`, so background Auto-Ping is active as soon as the host-owned `enabled` switch is set without requiring any manual edit. In the Management Center Web UI, the toggle switch remains OFF by default.
 
 ```yaml
 plugins:
@@ -32,8 +32,8 @@ plugins:
             enabled: true
             priority: 1
 
-            # Default: true. Set to false to opt out of background requests.
-            auto_ping_enabled: true
+            # Default: false. Set to true to opt out of background requests.
+            auto_ping_disabled: false
 
             scan_interval: "1m"
             activation_delay: "5s"
@@ -65,13 +65,13 @@ An explicit model disables model fallback:
 model: "gpt-5.5"
 ```
 
-An `auto_ping_enabled: false` you wrote yourself is preserved: re-enabling the plugin keeps the scanner stopped. Removing the key restores the default `true`.
+An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the plugin keeps the scanner stopped. Removing the key restores the default `false`.
 
 ### Defaults
 
 | Field                      | Default                            | Meaning                                                    |
 | -------------------------- | ---------------------------------- | ---------------------------------------------------------- |
-| `auto_ping_enabled`        | `true`                             | Set to `false` to opt out of background inference requests |
+| `auto_ping_disabled`       | `false`                            | Set to `true` to opt out of background inference requests  |
 | `scan_interval`            | `1m`                               | Quota observation frequency                                |
 | `activation_delay`         | `5s`                               | Delay after a fixed reset boundary                         |
 | `retry_cooldown`           | `15m`                              | Delay after retryable activation failure                   |

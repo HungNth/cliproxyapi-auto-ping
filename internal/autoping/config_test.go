@@ -23,7 +23,7 @@ func TestConfigDefaultsEnableAutoPing(t *testing.T) {
 func TestConfigParsesFlatStandaloneShape(t *testing.T) {
 	runtime := newTestRuntime(t, newFakeHost(), Options{})
 	cfg, err := runtime.parseConfig([]byte(`
-auto_ping_enabled: true
+auto_ping_disabled: false
 scan_interval: 30s
 activation_delay: 7s
 retry_cooldown: 5m
@@ -48,6 +48,14 @@ exclude_credentials:
 	}
 	if !cfg.Excludes("codex-test") || cfg.SchedulerBoostFallback {
 		t.Fatalf("unexpected filters/fallback: %#v", cfg)
+	}
+
+	disabledCfg, err := runtime.parseConfig([]byte("auto_ping_disabled: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabledCfg.AutoPingEnabled {
+		t.Fatal("auto_ping_disabled: true must set AutoPingEnabled to false")
 	}
 }
 
