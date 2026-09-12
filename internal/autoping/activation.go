@@ -118,10 +118,9 @@ func (r *Runtime) directActivate(ctx context.Context, cfg Config, material AuthM
 			"role":    "user",
 			"content": []map[string]string{{"type": "input_text", "text": cfg.Prompt}},
 		}},
-		"max_output_tokens": cfg.MaxOutputTokens,
-		"reasoning":         map[string]string{"effort": "none", "summary": "auto"},
-		"store":             false,
-		"stream":            true,
+		"reasoning": map[string]string{"effort": "none", "summary": "auto"},
+		"store":     false,
+		"stream":    true,
 	})
 	if err != nil {
 		return ActivationResult{Model: model, Transport: TransportDirectHTTP, Failure: FailureBusiness, Message: "encode Codex request failed"}
@@ -203,16 +202,20 @@ func appendCapped(current, next []byte, limit int) []byte {
 func evaluateCodexResponse(statusCode int, body []byte) (bool, FailureKind, string) {
 	switch {
 	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
-		return false, FailureAuth, "credential authentication failed"
-	case statusCode == http.StatusNotFound:
-		return false, FailureModel, "Codex model not found"
-	case statusCode >= 500:
-		return false, FailureRetryable, fmt.Sprintf("Codex returned HTTP %d", statusCode)
-	case statusCode < 200 || statusCode >= 300:
-		if isModelFailure(body) {
-			return false, FailureModel, "Codex model is unsupported"
+		if detail := extractErrorDetail(body); detail != "" {
+			return false, FailureAuth, fmt.Sprintf("credential authentication failed: %s", detail)
 		}
-		return false, FailureBusiness, fmt.Sprintf("Codex returned HTTP %d", statusCode)
+		return false, FailureAuth, "credential authentication failed"
+	case statusCode < 200 || statusCode >= 300:
+		message := formatHTTPErrorMessage(statusCode, body)
+		switch {
+		case statusCode == http.StatusBadRequest || statusCode == http.StatusNotFound || isModelFailure(body):
+			return false, FailureModel, message
+		case statusCode >= 500:
+			return false, FailureRetryable, message
+		default:
+			return false, FailureBusiness, message
+		}
 	}
 	trimmed := strings.TrimSpace(string(body))
 	if trimmed == "" {
@@ -319,4 +322,31 @@ func rawString(raw json.RawMessage) string {
 	var value string
 	_ = json.Unmarshal(raw, &value)
 	return strings.TrimSpace(value)
+}
+
+func formatHTTPErrorMessage(statusCode int, body []byte) string {
+	if detail := extractErrorDetail(body); detail != "" {
+		return fmt.Sprintf("Codex returned HTTP %d: %s", statusCode, detail)
+	}
+	return fmt.Sprintf("Codex returned HTTP %d", statusCode)
+}
+
+func extractErrorDetail(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err == nil {
+		if detail, ok := root["detail"].(string); ok && strings.TrimSpace(detail) != "" {
+			return strings.TrimSpace(detail)
+		}
+		if errObj, ok := root["error"].(map[string]any); ok {
+			if msg, ok := errObj["message"].(string); ok && strings.TrimSpace(msg) != "" {
+				return strings.TrimSpace(msg)
+			}
+		} else if errStr, ok := root["error"].(string); ok && strings.TrimSpace(errStr) != "" {
+			return strings.TrimSpace(errStr)
+		}
+	}
+	return ""
 }

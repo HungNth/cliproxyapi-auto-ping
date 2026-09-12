@@ -103,10 +103,9 @@ func (r *Runtime) schedulerActivate(ctx context.Context, cfg Config, file AuthFi
 	defer r.deleteFallbackSession(nonce)
 
 	body, err := json.Marshal(map[string]any{
-		"model":             model,
-		"input":             cfg.Prompt,
-		"max_output_tokens": cfg.MaxOutputTokens,
-		"store":             false,
+		"model": model,
+		"input": cfg.Prompt,
+		"store": false,
 	})
 	if err != nil {
 		return ActivationResult{Model: model, Transport: TransportSchedulerBoost, Failure: FailureBusiness, Message: "encode scheduler request failed"}
