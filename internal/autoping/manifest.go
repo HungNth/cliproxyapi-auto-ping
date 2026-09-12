@@ -55,7 +55,6 @@ var manifestFieldTypes = map[string]string{
 	"max_concurrency":          "integer",
 	"request_timeout":          "string",
 	"prompt":                   "string",
-	"max_output_tokens":        "integer",
 	"model":                    "string",
 	"model_candidates":         "array",
 	"transport":                "enum",

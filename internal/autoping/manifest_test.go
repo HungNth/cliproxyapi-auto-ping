@@ -39,9 +39,6 @@ metadata:
     - name: prompt
       type: string
       description: "Minimal prompt text sent to Codex."
-    - name: max_output_tokens
-      type: integer
-      description: "Maximum output tokens requested from Codex."
     - name: model
       type: string
       description: "Explicit model name or 'auto'."
@@ -69,7 +66,6 @@ defaults:
   max_concurrency: 1
   request_timeout: "60s"
   prompt: "ping"
-  max_output_tokens: 1
   model: "auto"
   model_candidates: ["gpt-5.5", "gpt-5.6-luna"]
   transport: "direct_http"
@@ -107,8 +103,8 @@ func TestParseManifestAcceptsCanonicalDocument(t *testing.T) {
 	if manifest.Metadata.Name != "Codex 5h Auto-Ping" || manifest.Metadata.Version != "0.1.0" || manifest.Metadata.Author != "HungNth" {
 		t.Fatalf("metadata = %#v", manifest.Metadata)
 	}
-	if len(manifest.Metadata.ConfigFields) != 14 {
-		t.Fatalf("config fields = %d, want 14", len(manifest.Metadata.ConfigFields))
+	if len(manifest.Metadata.ConfigFields) != 13 {
+		t.Fatalf("config fields = %d, want 13", len(manifest.Metadata.ConfigFields))
 	}
 	defaults := manifest.Defaults
 	if !defaults.AutoPingEnabled || defaults.ScanInterval != time.Minute || defaults.Model != "auto" {
@@ -193,12 +189,15 @@ func TestRegistrationServesManifestMetadata(t *testing.T) {
 	if metadata.Name != "Codex 5h Auto-Ping" || metadata.Version != "0.1.0" || metadata.Author != "HungNth" || metadata.GitHubRepository != "https://github.com/HungNth/cliproxyapi-auto-ping" {
 		t.Fatalf("metadata = %#v", metadata)
 	}
-	if len(metadata.ConfigFields) != 14 {
-		t.Fatalf("config fields = %d, want 14", len(metadata.ConfigFields))
+	if len(metadata.ConfigFields) != 13 {
+		t.Fatalf("config fields = %d, want 13", len(metadata.ConfigFields))
 	}
 	byName := map[string]configField{}
 	for _, field := range metadata.ConfigFields {
 		byName[field.Name] = field
+	}
+	if _, exists := byName["max_output_tokens"]; exists {
+		t.Fatal("registration metadata must not contain max_output_tokens")
 	}
 	disabled := byName["auto_ping_disabled"]
 	if disabled.DefaultValue != false || disabled.Description != "Set to true to disable background Codex inference requests (Default: false)." {

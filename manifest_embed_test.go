@@ -31,4 +31,9 @@ func TestEmbeddedManifestMatchesPackagingContract(t *testing.T) {
 	if !foundDisabledField {
 		t.Fatal("manifest must declare auto_ping_disabled config field")
 	}
+	for _, f := range manifest.Metadata.ConfigFields {
+		if f.Name == "max_output_tokens" {
+			t.Fatal("manifest must not declare max_output_tokens config field")
+		}
+	}
 }

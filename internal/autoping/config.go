@@ -25,7 +25,6 @@ type Config struct {
 	MaxConcurrency         int
 	RequestTimeout         time.Duration
 	Prompt                 string
-	MaxOutputTokens        int
 	Model                  string
 	ModelCandidates        []string
 	Transport              string
@@ -42,7 +41,6 @@ type rawConfig struct {
 	MaxConcurrency         *int     `yaml:"max_concurrency"`
 	RequestTimeout         string   `yaml:"request_timeout"`
 	Prompt                 *string  `yaml:"prompt"`
-	MaxOutputTokens        *int     `yaml:"max_output_tokens"`
 	Model                  *string  `yaml:"model"`
 	ModelCandidates        []string `yaml:"model_candidates"`
 	Transport              *string  `yaml:"transport"`
@@ -109,14 +107,6 @@ func configFromRaw(raw rawConfig, base Config, requireComplete bool) (Config, er
 	}
 	if cfg.Prompt == "" {
 		return Config{}, fmt.Errorf("%w: prompt must not be empty", ErrInvalidConfig)
-	}
-	if raw.MaxOutputTokens != nil {
-		cfg.MaxOutputTokens = *raw.MaxOutputTokens
-	} else if requireComplete {
-		return Config{}, fmt.Errorf("%w: manifest defaults must set max_output_tokens", ErrInvalidConfig)
-	}
-	if cfg.MaxOutputTokens < 1 || cfg.MaxOutputTokens > 16 {
-		return Config{}, fmt.Errorf("%w: max_output_tokens must be between 1 and 16", ErrInvalidConfig)
 	}
 	if raw.Model != nil {
 		cfg.Model = strings.TrimSpace(*raw.Model)
@@ -196,8 +186,6 @@ func (c Config) fieldValue(name string) any {
 		return c.RequestTimeout.String()
 	case "prompt":
 		return c.Prompt
-	case "max_output_tokens":
-		return c.MaxOutputTokens
 	case "model":
 		return c.Model
 	case "model_candidates":

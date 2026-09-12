@@ -28,9 +28,6 @@ metadata:
     - name: "prompt"
       type: "string"
       description: "Minimal prompt text sent to Codex."
-    - name: "max_output_tokens"
-      type: "integer"
-      description: "Maximum output tokens requested from Codex."
     - name: "model"
       type: "string"
       description: "Explicit model name or 'auto'."
@@ -58,7 +55,6 @@ defaults:
   max_concurrency: 1
   request_timeout: "60s"
   prompt: "ping"
-  max_output_tokens: 1
   model: "auto"
   model_candidates: ["gpt-5.5", "gpt-5.6-luna"]
   transport: "direct_http"

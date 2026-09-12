@@ -30,7 +30,6 @@ retry_cooldown: 5m
 max_concurrency: 2
 request_timeout: 45s
 prompt: "1"
-max_output_tokens: 2
 model: auto
 model_candidates:
   - gpt-5.5
