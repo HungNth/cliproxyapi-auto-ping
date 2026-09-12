@@ -1,0 +1,36 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.2] - 2026-09-12
+
+### Fixed
+
+- Omit unsupported `max_output_tokens` parameter from direct HTTP and scheduler activation payloads, resolving upstream Codex Responses API `HTTP 400 Bad Request` failures (`{"detail":"Unsupported parameter: max_output_tokens"}`).
+- Surface detailed upstream error messages (`detail` and `error.message`) in error logs and `state.json` instead of generic `Codex returned HTTP <status>`.
+- Classify HTTP 400 and 404 responses as candidate model failures (`FailureModel`) during `auto` model selection mode, allowing the runtime to fall back to subsequent configured candidates (e.g. `gpt-5.6-luna`) before entering retry cooldown.
+
+### Removed
+
+- Remove `max_output_tokens` configuration field and manifest defaults across manifest, schema, parser, and documentation.
+
+## [0.1.1] - 2026-09-11
+
+### Changed
+
+- Switch configuration field from `auto_ping_enabled` to negative boolean `auto_ping_disabled` (default: `false`) to ensure proper toggle presentation in CLIProxyAPI Management Center Web UI without host config pollution.
+
+## [0.1.0] - 2026-09-10
+
+### Added
+
+- Initial release of Codex 5h Auto-Ping plugin for CLIProxyAPI (`cliproxyapi-auto-ping`).
+- Automatic detection of Codex rolling 5-hour quota windows (`limit_window_seconds: 18000`).
+- Background quota scanner and prompt trigger when reset boundaries are reached.
+- Direct HTTP activation transport calling upstream Codex responses endpoint with account credentials.
+- Scheduler boost fallback transport for temporary priority boosting.
+- Persistent state tracking across restarts (`state.json`).
+- Management API routes and status reporting with manifest identity.
