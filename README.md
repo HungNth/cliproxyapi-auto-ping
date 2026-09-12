@@ -42,7 +42,6 @@ plugins:
             request_timeout: "60s"
 
             prompt: "ping"
-            max_output_tokens: 1
 
             # auto tries candidates in order and advances only for a model-specific error.
             model: "auto"
@@ -78,7 +77,6 @@ An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the p
 | `max_concurrency`          | `1`                                | Maximum credentials processed concurrently                 |
 | `request_timeout`          | `60s`                              | Quota/inference operation timeout                          |
 | `prompt`                   | `ping`                             | Minimal user input                                         |
-| `max_output_tokens`        | `1`                                | Maximum generated tokens                                   |
 | `model`                    | `auto`                             | Uses `model_candidates`                                    |
 | `transport`                | `direct_http`                      | Guarantees the intended credential is used                 |
 | `scheduler_boost_fallback` | `true`                             | Fallback only for host/transport failures                  |
