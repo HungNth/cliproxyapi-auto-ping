@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 const testManifestYAML = `schema_version: 1
@@ -21,12 +20,12 @@ metadata:
     - name: auto_ping_disabled
       type: boolean
       description: "Set to true to disable background Codex inference requests."
-    - name: scan_interval
+    - name: schedule
+      type: array
+      description: "List of daily reset milestone times in 24-hour HH:MM format, e.g. 05:00, 10:00, 15:00, 20:00."
+    - name: timezone
       type: string
-      description: "Quota scan interval as a Go duration, for example 1m, 30s."
-    - name: activation_delay
-      type: string
-      description: "Safety delay after a fixed reset boundary before pinging."
+      description: "Timezone for schedule milestones, e.g. Local, UTC, or Asia/Ho_Chi_Minh."
     - name: retry_cooldown
       type: string
       description: "Cooldown delay before retrying after an activation failure."
@@ -60,9 +59,9 @@ metadata:
       description: "Path to the persistent state JSON file."
 defaults:
   auto_ping_disabled: false
-  scan_interval: "1m"
-  activation_delay: "5s"
-  retry_cooldown: "15m"
+  schedule: ["05:00", "10:00", "15:00", "20:00"]
+  timezone: "Local"
+  retry_cooldown: "2m"
   max_concurrency: 1
   request_timeout: "60s"
   prompt: "ping"
@@ -107,7 +106,7 @@ func TestParseManifestAcceptsCanonicalDocument(t *testing.T) {
 		t.Fatalf("config fields = %d, want 13", len(manifest.Metadata.ConfigFields))
 	}
 	defaults := manifest.Defaults
-	if !defaults.AutoPingEnabled || defaults.ScanInterval != time.Minute || defaults.Model != "auto" {
+	if !defaults.AutoPingEnabled || !slices.Equal(defaults.Schedule, []string{"05:00", "10:00", "15:00", "20:00"}) || defaults.Timezone != "Local" || defaults.Model != "auto" {
 		t.Fatalf("defaults = %#v", defaults)
 	}
 	if got := defaults.Models(); !slices.Equal(got, []string{"gpt-5.5", "gpt-5.6-luna"}) {
@@ -140,7 +139,8 @@ func TestParseManifestRejectsInvalidDocuments(t *testing.T) {
 		{name: "empty field description", edits: []string{"      description: \"Minimal prompt text sent to Codex.\"=>      description: \"\""}, sentinel: ErrInvalidManifest},
 		{name: "missing default key", edits: []string{"  max_concurrency: 1\n=>"}, sentinel: ErrInvalidConfig},
 		{name: "missing auto_ping_disabled default", edits: []string{"  auto_ping_disabled: false\n=>"}, sentinel: ErrInvalidConfig},
-		{name: "invalid default duration", edits: []string{"  scan_interval: \"1m\"=>  scan_interval: \"0s\""}, sentinel: ErrInvalidConfig},
+		{name: "invalid default schedule", edits: []string{"  schedule: [\"05:00\", \"10:00\", \"15:00\", \"20:00\"]=>  schedule: [\"25:00\"]"}, sentinel: ErrInvalidConfig},
+		{name: "invalid default timezone", edits: []string{"  timezone: \"Local\"=>  timezone: \"Invalid/Bogus_Zone\""}, sentinel: ErrInvalidConfig},
 		{name: "invalid default concurrency", edits: []string{"  max_concurrency: 1=>  max_concurrency: 0"}, sentinel: ErrInvalidConfig},
 		{name: "auto default without candidates", edits: []string{"  model_candidates: [\"gpt-5.5\", \"gpt-5.6-luna\"]=>  model_candidates: []"}, sentinel: ErrInvalidConfig},
 		{name: "invalid default transport", edits: []string{"  transport: \"direct_http\"=>  transport: \"bogus\""}, sentinel: ErrInvalidConfig},
@@ -220,7 +220,7 @@ func TestRegistrationServesManifestMetadata(t *testing.T) {
 func TestInstanceConfigurationOverridesManifestDefaults(t *testing.T) {
 	runtime := newTestRuntime(t, newFakeHost(), Options{})
 	cfg := testConfig(t, runtime, "")
-	if cfg.ScanInterval != time.Minute || !cfg.AutoPingEnabled {
+	if !slices.Equal(cfg.Schedule, []string{"05:00", "10:00", "15:00", "20:00"}) || cfg.Timezone != "Local" || !cfg.AutoPingEnabled {
 		t.Fatalf("omitted settings must inherit manifest defaults: %#v", cfg)
 	}
 	cfg = testConfig(t, runtime, "auto_ping_disabled: true\n")
@@ -231,8 +231,8 @@ func TestInstanceConfigurationOverridesManifestDefaults(t *testing.T) {
 	if !cfg.AutoPingEnabled {
 		t.Fatalf("explicit false must preserve auto-ping enabled: %#v", cfg)
 	}
-	cfg = testConfig(t, runtime, "scan_interval: 30s\nmodel: gpt-9\n")
-	if cfg.ScanInterval != 30*time.Second || cfg.Model != "gpt-9" || !slices.Equal(cfg.Models(), []string{"gpt-9"}) {
+	cfg = testConfig(t, runtime, "schedule:\n  - \"08:00\"\n  - \"16:00\"\ntimezone: UTC\nmodel: gpt-9\n")
+	if !slices.Equal(cfg.Schedule, []string{"08:00", "16:00"}) || cfg.Timezone != "UTC" || cfg.Model != "gpt-9" || !slices.Equal(cfg.Models(), []string{"gpt-9"}) {
 		t.Fatalf("explicit settings must override manifest defaults: %#v", cfg)
 	}
 }

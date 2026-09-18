@@ -35,9 +35,13 @@ plugins:
             # Default: false. Set to true to opt out of background requests.
             auto_ping_disabled: false
 
-            scan_interval: "1m"
-            activation_delay: "5s"
-            retry_cooldown: "15m"
+            schedule:
+                - "05:00"
+                - "10:00"
+                - "15:00"
+                - "20:00"
+            timezone: "Local"
+            retry_cooldown: "2m"
             max_concurrency: 1
             request_timeout: "60s"
 
@@ -71,9 +75,9 @@ An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the p
 | Field                      | Default                            | Meaning                                                    |
 | -------------------------- | ---------------------------------- | ---------------------------------------------------------- |
 | `auto_ping_disabled`       | `false`                            | Set to `true` to opt out of background inference requests  |
-| `scan_interval`            | `1m`                               | Quota observation frequency                                |
-| `activation_delay`         | `5s`                               | Delay after a fixed reset boundary                         |
-| `retry_cooldown`           | `15m`                              | Delay after retryable activation failure                   |
+| `schedule`                 | `["05:00", "10:00", "15:00", "20:00"]` | Daily reset milestone times in 24-hour format          |
+| `timezone`                 | `Local`                            | Timezone for daily schedule milestones                     |
+| `retry_cooldown`           | `2m`                               | Delay before retrying after an activation failure          |
 | `max_concurrency`          | `1`                                | Maximum credentials processed concurrently                 |
 | `request_timeout`          | `60s`                              | Quota/inference operation timeout                          |
 | `prompt`                   | `ping`                             | Minimal user input                                         |

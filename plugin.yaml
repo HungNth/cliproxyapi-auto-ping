@@ -10,12 +10,12 @@ metadata:
     - name: "auto_ping_disabled"
       type: "boolean"
       description: "Set to true to disable background Codex inference requests."
-    - name: "scan_interval"
+    - name: "schedule"
+      type: "array"
+      description: "List of daily reset milestone times in 24-hour HH:MM format, e.g. 05:00, 10:00, 15:00, 20:00."
+    - name: "timezone"
       type: "string"
-      description: "Quota scan interval as a Go duration, for example 1m, 30s."
-    - name: "activation_delay"
-      type: "string"
-      description: "Safety delay after a fixed reset boundary before pinging."
+      description: "Timezone for schedule milestones, e.g. Local, UTC, or Asia/Ho_Chi_Minh."
     - name: "retry_cooldown"
       type: "string"
       description: "Cooldown delay before retrying after an activation failure."
@@ -49,9 +49,9 @@ metadata:
       description: "Path to the persistent state JSON file."
 defaults:
   auto_ping_disabled: false
-  scan_interval: "1m"
-  activation_delay: "5s"
-  retry_cooldown: "15m"
+  schedule: ["05:00", "10:00", "15:00", "20:00"]
+  timezone: "Local"
+  retry_cooldown: "2m"
   max_concurrency: 1
   request_timeout: "60s"
   prompt: "ping"
