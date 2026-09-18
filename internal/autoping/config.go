@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata"
 
 	"gopkg.in/yaml.v3"
 )
@@ -19,8 +21,9 @@ var ErrInvalidConfig = errors.New("invalid configuration")
 
 type Config struct {
 	AutoPingEnabled        bool
-	ScanInterval           time.Duration
-	ActivationDelay        time.Duration
+	Schedule               []string
+	Timezone               string
+	Location               *time.Location
 	RetryCooldown          time.Duration
 	MaxConcurrency         int
 	RequestTimeout         time.Duration
@@ -35,8 +38,8 @@ type Config struct {
 
 type rawConfig struct {
 	AutoPingDisabled       *bool    `yaml:"auto_ping_disabled"`
-	ScanInterval           string   `yaml:"scan_interval"`
-	ActivationDelay        string   `yaml:"activation_delay"`
+	Schedule               []string `yaml:"schedule"`
+	Timezone               *string  `yaml:"timezone"`
 	RetryCooldown          string   `yaml:"retry_cooldown"`
 	MaxConcurrency         *int     `yaml:"max_concurrency"`
 	RequestTimeout         string   `yaml:"request_timeout"`
@@ -56,23 +59,24 @@ func configFromRaw(raw rawConfig, base Config, requireComplete bool) (Config, er
 	} else if requireComplete {
 		return Config{}, fmt.Errorf("%w: manifest defaults must set auto_ping_disabled", ErrInvalidConfig)
 	}
-	if raw.ScanInterval != "" {
-		parsed, err := positiveDuration("scan_interval", raw.ScanInterval)
+	if raw.Schedule != nil {
+		parsed, err := parseSchedule(raw.Schedule)
 		if err != nil {
 			return Config{}, err
 		}
-		cfg.ScanInterval = parsed
+		cfg.Schedule = parsed
 	} else if requireComplete {
-		return Config{}, fmt.Errorf("%w: manifest defaults must set scan_interval", ErrInvalidConfig)
+		return Config{}, fmt.Errorf("%w: manifest defaults must set schedule", ErrInvalidConfig)
 	}
-	if raw.ActivationDelay != "" {
-		parsed, err := nonNegativeDuration("activation_delay", raw.ActivationDelay)
+	if raw.Timezone != nil {
+		tz, loc, err := parseTimezone(*raw.Timezone)
 		if err != nil {
 			return Config{}, err
 		}
-		cfg.ActivationDelay = parsed
+		cfg.Timezone = tz
+		cfg.Location = loc
 	} else if requireComplete {
-		return Config{}, fmt.Errorf("%w: manifest defaults must set activation_delay", ErrInvalidConfig)
+		return Config{}, fmt.Errorf("%w: manifest defaults must set timezone", ErrInvalidConfig)
 	}
 	if raw.RetryCooldown != "" {
 		parsed, err := positiveDuration("retry_cooldown", raw.RetryCooldown)
@@ -174,10 +178,10 @@ func (c Config) fieldValue(name string) any {
 	switch name {
 	case "auto_ping_disabled":
 		return !c.AutoPingEnabled
-	case "scan_interval":
-		return c.ScanInterval.String()
-	case "activation_delay":
-		return c.ActivationDelay.String()
+	case "schedule":
+		return slices.Clone(c.Schedule)
+	case "timezone":
+		return c.Timezone
 	case "retry_cooldown":
 		return c.RetryCooldown.String()
 	case "max_concurrency":
@@ -232,4 +236,49 @@ func uniqueStrings(values []string) []string {
 		result = append(result, value)
 	}
 	return result
+}
+
+func parseSchedule(items []string) ([]string, error) {
+	if len(items) == 0 {
+		return nil, fmt.Errorf("%w: schedule must not be empty", ErrInvalidConfig)
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		s := strings.TrimSpace(item)
+		if len(s) != 5 || s[2] != ':' {
+			return nil, fmt.Errorf("%w: schedule element %q must be HH:MM in 24-hour format", ErrInvalidConfig, item)
+		}
+		hh, errH := strconv.Atoi(s[:2])
+		mm, errM := strconv.Atoi(s[3:])
+		if errH != nil || errM != nil || hh < 0 || hh > 23 || mm < 0 || mm > 59 {
+			return nil, fmt.Errorf("%w: schedule element %q must be HH:MM in 24-hour format (00:00-23:59)", ErrInvalidConfig, item)
+		}
+		formatted := fmt.Sprintf("%02d:%02d", hh, mm)
+		if !slices.Contains(result, formatted) {
+			result = append(result, formatted)
+		}
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("%w: schedule must not be empty", ErrInvalidConfig)
+	}
+	slices.Sort(result)
+	return result, nil
+}
+
+func parseTimezone(tz string) (string, *time.Location, error) {
+	s := strings.TrimSpace(tz)
+	if s == "" {
+		return "", nil, fmt.Errorf("%w: timezone must not be empty", ErrInvalidConfig)
+	}
+	if strings.EqualFold(s, "Local") {
+		return "Local", time.Local, nil
+	}
+	if strings.EqualFold(s, "UTC") {
+		return "UTC", time.UTC, nil
+	}
+	loc, err := time.LoadLocation(s)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: invalid timezone %q: %v", ErrInvalidConfig, s, err)
+	}
+	return s, loc, nil
 }

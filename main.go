@@ -77,6 +77,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	_ "time/tzdata"
 	"unsafe"
 
 	"github.com/HungNth/cliproxyapi-auto-ping/internal/autoping"
