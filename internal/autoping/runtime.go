@@ -86,7 +86,7 @@ func (r *Runtime) Configure(ctx context.Context, cfg Config) error {
 	if cfg.AutoPingEnabled {
 		scannerCtx, cancel := context.WithCancel(context.Background())
 		r.scannerCancel = cancel
-		r.scannerWG.Go(func() { r.scanLoop(scannerCtx, cfg.ScanInterval) })
+		r.scannerWG.Go(func() { r.scheduleLoop(scannerCtx) })
 	}
 	return nil
 }
@@ -121,24 +121,72 @@ func (r *Runtime) stopScannerLocked() {
 	}
 }
 
-func (r *Runtime) scanLoop(ctx context.Context, interval time.Duration) {
+func (r *Runtime) scheduleLoop(ctx context.Context) {
 	if !sleepContext(ctx, r.startupDelay) {
 		return
 	}
-	_ = r.ScanOnce(ctx)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	r.startupCatchUp(ctx)
+
 	for {
-		select {
-		case <-ctx.Done():
+		cfg, store, ok := r.snapshot()
+		if !ok || !cfg.AutoPingEnabled {
 			return
-		case <-ticker.C:
-			_ = r.ScanOnce(ctx)
 		}
+		target, key := NextMilestone(r.now(), cfg.Schedule, cfg.Location)
+		if retryTime, hasRetry := r.nextRetryTime(store, r.now(), target); hasRetry {
+			for r.now().Before(retryTime) {
+				if !sleepContext(ctx, retryTime.Sub(r.now())) {
+					return
+				}
+			}
+			_ = r.dispatchRetries(ctx)
+			continue
+		}
+		for r.now().Before(target) {
+			if !sleepContext(ctx, target.Sub(r.now())) {
+				return
+			}
+		}
+		_ = r.DispatchMilestone(ctx, key, target)
 	}
 }
 
+func (r *Runtime) startupCatchUp(ctx context.Context) {
+	cfg, _, ok := r.snapshot()
+	if !ok || !cfg.AutoPingEnabled {
+		return
+	}
+	latestTime, latestKey, hasLatest := CurrentOrLatestMilestone(r.now(), cfg.Schedule, cfg.Location)
+	if !hasLatest {
+		return
+	}
+	nextTime, _ := NextMilestone(r.now(), cfg.Schedule, cfg.Location)
+	if nextTime.Sub(r.now()) < 1*time.Hour {
+		r.log(ctx, "info", "startup catch-up skipped: next milestone is less than 1 hour away", map[string]any{
+			"latest_milestone": latestKey,
+			"next_milestone":   nextTime.Format(time.RFC3339),
+		})
+		return
+	}
+	r.log(ctx, "info", "startup catch-up triggered", map[string]any{
+		"milestone": latestKey,
+	})
+	_ = r.DispatchMilestone(ctx, latestKey, latestTime)
+}
+
 func (r *Runtime) ScanOnce(ctx context.Context) error {
+	cfg, _, ok := r.snapshot()
+	if !ok || !cfg.AutoPingEnabled {
+		return nil
+	}
+	target, key, ok := CurrentOrLatestMilestone(r.now(), cfg.Schedule, cfg.Location)
+	if !ok {
+		target, key = NextMilestone(r.now().Add(-time.Second), cfg.Schedule, cfg.Location)
+	}
+	return r.DispatchMilestone(ctx, key, target)
+}
+
+func (r *Runtime) DispatchMilestone(ctx context.Context, milestoneKey string, milestoneTime time.Time) error {
 	cfg, store, ok := r.snapshot()
 	if !ok || !cfg.AutoPingEnabled {
 		return nil
@@ -150,23 +198,181 @@ func (r *Runtime) ScanOnce(ctx context.Context) error {
 
 	files, err := r.host.ListAuth(ctx)
 	if err != nil {
-		r.log(ctx, "warn", "auto-ping credential scan failed", map[string]any{"reason": "credential_list_failed"})
+		r.log(ctx, "warn", "auto-ping credential listing failed", map[string]any{"reason": "credential_list_failed"})
 		return err
 	}
-	workers := min(cfg.MaxConcurrency, len(files))
-	if workers == 0 {
+
+	eligible := make([]AuthFile, 0, len(files))
+	for _, file := range files {
+		credentialID := file.CredentialID()
+		if credentialID == "" || !isCodex(file) {
+			continue
+		}
+		if reason := ineligibleReason(cfg, file); reason != "" {
+			r.updateStatus(ctx, store, credentialID, "skipped", reason, true)
+			continue
+		}
+		state := store.Credential(credentialID)
+		credentialVersion := file.VersionKey()
+		if state.BlockedCredentialVersion != "" && state.BlockedCredentialVersion == credentialVersion {
+			r.updateStatus(ctx, store, credentialID, "blocked", "credential_unchanged_after_auth_failure", true)
+			continue
+		}
+		if state.BlockedCredentialVersion != "" {
+			_ = store.Update(ctx, credentialID, func(current *CredentialState) {
+				current.BlockedCredentialVersion = ""
+				current.LastError = ""
+			})
+		}
+		if state.LastProcessedMilestone == milestoneKey {
+			continue
+		}
+		eligible = append(eligible, file)
+	}
+
+	if len(eligible) == 0 {
+		_ = store.SetLastMilestone(ctx, milestoneKey)
 		return nil
 	}
-	jobs := make(chan AuthFile, len(files))
+
+	workers := min(cfg.MaxConcurrency, len(eligible))
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan AuthFile, len(eligible))
 	var workersWG sync.WaitGroup
 	for range workers {
 		workersWG.Go(func() {
 			for file := range jobs {
-				r.processCredential(ctx, cfg, store, file)
+				r.dispatchCredentialMilestone(ctx, cfg, store, file, milestoneKey, milestoneTime, false)
 			}
 		})
 	}
+	for _, file := range eligible {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			workersWG.Wait()
+			return ctx.Err()
+		case jobs <- file:
+		}
+	}
+	close(jobs)
+	workersWG.Wait()
+
+	_ = store.SetLastMilestone(ctx, milestoneKey)
+	return nil
+}
+
+func (r *Runtime) nextRetryTime(store *StateStore, now, milestoneTarget time.Time) (time.Time, bool) {
+	if store == nil {
+		return time.Time{}, false
+	}
+	var earliest time.Time
+	found := false
+	for _, account := range store.Accounts() {
+		if account.NextRetryAt.IsZero() || account.RetryCount < 1 || account.RetryCount >= 3 {
+			continue
+		}
+		if account.BlockedCredentialVersion != "" {
+			continue
+		}
+		if !account.NextRetryAt.Before(milestoneTarget) {
+			continue
+		}
+		if !found || account.NextRetryAt.Before(earliest) {
+			earliest = account.NextRetryAt
+			found = true
+		}
+	}
+	if !found {
+		return time.Time{}, false
+	}
+	if earliest.Before(now) {
+		return now, true
+	}
+	return earliest, true
+}
+
+func (r *Runtime) dispatchRetries(ctx context.Context) error {
+	return r.DispatchRetries(ctx)
+}
+
+func (r *Runtime) DispatchRetries(ctx context.Context) error {
+	cfg, store, ok := r.snapshot()
+	if !ok || !cfg.AutoPingEnabled {
+		return nil
+	}
+	if !r.scanRunning.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer r.scanRunning.Store(false)
+
+	target, key, hasLatest := CurrentOrLatestMilestone(r.now(), cfg.Schedule, cfg.Location)
+	if !hasLatest {
+		key = store.LastProcessedMilestone()
+		target = r.now()
+	}
+
+	files, err := r.host.ListAuth(ctx)
+	if err != nil {
+		r.log(ctx, "warn", "auto-ping credential listing failed during retry", map[string]any{"reason": "credential_list_failed"})
+		return err
+	}
+
+	now := r.now()
+	due := make([]AuthFile, 0, len(files))
 	for _, file := range files {
+		credentialID := file.CredentialID()
+		if credentialID == "" || !isCodex(file) {
+			continue
+		}
+		if reason := ineligibleReason(cfg, file); reason != "" {
+			r.updateStatus(ctx, store, credentialID, "skipped", reason, true)
+			continue
+		}
+		state := store.Credential(credentialID)
+		credentialVersion := file.VersionKey()
+		if state.BlockedCredentialVersion != "" && state.BlockedCredentialVersion == credentialVersion {
+			r.updateStatus(ctx, store, credentialID, "blocked", "credential_unchanged_after_auth_failure", true)
+			continue
+		}
+		if state.BlockedCredentialVersion != "" {
+			_ = store.Update(ctx, credentialID, func(current *CredentialState) {
+				current.BlockedCredentialVersion = ""
+				current.LastError = ""
+			})
+		}
+		if state.LastProcessedMilestone == key {
+			continue
+		}
+		if state.NextRetryAt.IsZero() || state.NextRetryAt.After(now) {
+			continue
+		}
+		if state.RetryCount < 1 || state.RetryCount >= 3 {
+			continue
+		}
+		due = append(due, file)
+	}
+
+	if len(due) == 0 {
+		return nil
+	}
+
+	workers := min(cfg.MaxConcurrency, len(due))
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan AuthFile, len(due))
+	var workersWG sync.WaitGroup
+	for range workers {
+		workersWG.Go(func() {
+			for file := range jobs {
+				r.dispatchCredentialMilestone(ctx, cfg, store, file, key, target, true)
+			}
+		})
+	}
+	for _, file := range due {
 		select {
 		case <-ctx.Done():
 			close(jobs)
@@ -180,40 +386,14 @@ func (r *Runtime) ScanOnce(ctx context.Context) error {
 	return nil
 }
 
-func (r *Runtime) snapshot() (Config, *StateStore, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.config, r.store, !r.shutdown && r.host != nil && r.store != nil
-}
-
-func (r *Runtime) processCredential(ctx context.Context, cfg Config, store *StateStore, file AuthFile) {
+func (r *Runtime) dispatchCredentialMilestone(ctx context.Context, cfg Config, store *StateStore, file AuthFile, milestoneKey string, milestoneTime time.Time, isRetry bool) {
 	credentialID := file.CredentialID()
-	if credentialID == "" || !isCodex(file) {
-		return
-	}
 	if _, loaded := r.inFlight.LoadOrStore(credentialID, struct{}{}); loaded {
 		return
 	}
 	defer r.inFlight.Delete(credentialID)
 
-	if reason := ineligibleReason(cfg, file); reason != "" {
-		r.updateStatus(ctx, store, credentialID, "skipped", reason, true)
-		return
-	}
-
-	state := store.Credential(credentialID)
 	credentialVersion := file.VersionKey()
-	if state.BlockedCredentialVersion != "" && state.BlockedCredentialVersion == credentialVersion {
-		r.updateStatus(ctx, store, credentialID, "blocked", "credential_unchanged_after_auth_failure", true)
-		return
-	}
-	if state.BlockedCredentialVersion != "" {
-		_ = store.Update(ctx, credentialID, func(current *CredentialState) {
-			current.BlockedCredentialVersion = ""
-			current.LastError = ""
-		})
-	}
-
 	document, material, err := r.credentialMaterial(ctx, file)
 	if err != nil {
 		_ = store.Update(ctx, credentialID, func(current *CredentialState) {
@@ -229,80 +409,51 @@ func (r *Runtime) processCredential(ctx context.Context, cfg Config, store *Stat
 		file.Name = document.Name
 	}
 
-	observedAt := r.now().UTC()
-	requestCtx, cancel := context.WithTimeoutCause(ctx, cfg.RequestTimeout, errors.New("quota request timeout"))
-	observation, err := r.fetchObservation(requestCtx, material, observedAt)
-	cancel()
-	if err != nil {
-		r.handleObservationError(ctx, store, credentialID, credentialVersion, err)
-		return
-	}
-
-	state = store.Credential(credentialID)
-	decision := EvaluateObservation(state, observation, observedAt, cfg.ActivationDelay)
-	if !state.NextRetryAt.IsZero() && observedAt.Before(state.NextRetryAt) {
-		decision = WindowDecision{Kind: DecisionWaiting, Reason: "cooldown"}
-	}
-	if !decision.Boundary.IsZero() && sameTime(state.LastProcessedResetAt, decision.Boundary) {
-		decision = WindowDecision{Kind: DecisionWaiting, Reason: "cycle_already_processed", ClearPending: true}
-	}
-	if err := store.Update(ctx, credentialID, func(current *CredentialState) {
-		applyObservationDecision(current, observation, decision)
-	}); err != nil {
-		r.log(ctx, "warn", "auto-ping state persistence failed", map[string]any{"credential": credentialID})
-		return
-	}
-
-	switch decision.Kind {
-	case DecisionExternal:
-		r.log(ctx, "debug", "auto-ping skipped for external activation", map[string]any{"credential": credentialID, "reset_at": decision.Boundary})
-		return
-	case DecisionWaiting:
-		return
-	case DecisionReady:
-	default:
-		return
-	}
-
 	attemptAt := r.now().UTC()
-	if err := store.Update(ctx, credentialID, func(current *CredentialState) {
+	_ = store.Update(ctx, credentialID, func(current *CredentialState) {
 		current.Status = "in_flight"
-		current.Reason = decision.Reason
+		current.Reason = "milestone_triggered"
 		current.LastAttemptAt = attemptAt
 		current.LastAttemptStatus = "in_flight"
 		current.Attempts++
-	}); err != nil {
-		return
-	}
-	r.log(ctx, "info", "Codex auto-ping started", map[string]any{"credential": credentialID, "reset_at": decision.Boundary})
+		current.NextRetryAt = time.Time{}
+		if !isRetry {
+			current.RetryCount = 0
+		}
+	})
+	r.log(ctx, "info", "Codex scheduled auto-ping started", map[string]any{"credential": credentialID, "milestone": milestoneKey, "is_retry": isRetry})
 
 	result := r.activate(ctx, cfg, file, material)
 	completedAt := r.now().UTC()
 	if result.Success {
 		_ = store.Update(ctx, credentialID, func(current *CredentialState) {
 			current.Status = "waiting"
-			current.Reason = "ping_succeeded"
-			current.LastProcessedResetAt = decision.Boundary.UTC()
-			current.ActivationSource = "auto_ping"
-			current.AwaitingStabilization = true
+			current.Reason = "milestone_ping_succeeded"
+			current.LastProcessedMilestone = milestoneKey
+			current.LastProcessedMilestoneAt = milestoneTime.UTC()
 			current.LastPingAt = completedAt
 			current.LastAttemptStatus = "success"
 			current.LastError = ""
 			current.NextRetryAt = time.Time{}
+			current.RetryCount = 0
 			current.BlockedCredentialVersion = ""
 			current.SelectedModel = result.Model
 			current.Transport = result.Transport
 			current.Successes++
 		})
-		r.log(ctx, "info", "Codex auto-ping succeeded", map[string]any{
-			"credential": credentialID, "reset_at": decision.Boundary, "model": result.Model, "transport": result.Transport,
+		r.log(ctx, "info", "Codex scheduled auto-ping succeeded", map[string]any{
+			"credential": credentialID, "milestone": milestoneKey, "model": result.Model, "transport": result.Transport,
 		})
 		return
 	}
 
 	_ = store.Update(ctx, credentialID, func(current *CredentialState) {
 		current.Status = failureStatus(result.Failure)
-		current.Reason = string(result.Failure)
+		if result.Failure == FailureAuth {
+			current.Reason = "credential_unchanged_after_auth_failure"
+		} else {
+			current.Reason = string(result.Failure)
+		}
 		current.LastAttemptStatus = "failed"
 		current.LastError = safeErrorMessage(result.Message)
 		current.SelectedModel = result.Model
@@ -311,15 +462,27 @@ func (r *Runtime) processCredential(ctx context.Context, cfg Config, store *Stat
 		if result.Failure == FailureAuth {
 			current.BlockedCredentialVersion = credentialVersion
 			current.NextRetryAt = time.Time{}
+			current.RetryCount = 0
 		} else {
-			current.NextRetryAt = completedAt.Add(cfg.RetryCooldown)
+			current.RetryCount++
+			if current.RetryCount < 3 {
+				current.NextRetryAt = completedAt.Add(cfg.RetryCooldown)
+			} else {
+				current.NextRetryAt = time.Time{}
+			}
 		}
 	})
-	fields := map[string]any{"credential": credentialID, "reset_at": decision.Boundary, "reason": result.Failure}
+	fields := map[string]any{"credential": credentialID, "milestone": milestoneKey, "reason": result.Failure}
 	if result.Failure != FailureAuth {
 		fields["retry_at"] = completedAt.Add(cfg.RetryCooldown)
 	}
-	r.log(ctx, "warn", "Codex auto-ping failed", fields)
+	r.log(ctx, "warn", "Codex scheduled auto-ping failed", fields)
+}
+
+func (r *Runtime) snapshot() (Config, *StateStore, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.config, r.store, !r.shutdown && r.host != nil && r.store != nil
 }
 
 func (r *Runtime) credentialMaterial(ctx context.Context, file AuthFile) (AuthDocument, AuthMaterial, error) {
@@ -335,57 +498,6 @@ func (r *Runtime) credentialMaterial(ctx context.Context, file AuthFile) (AuthDo
 		return AuthDocument{}, AuthMaterial{}, err
 	}
 	return document, material, nil
-}
-
-func (r *Runtime) handleObservationError(ctx context.Context, store *StateStore, credentialID, version string, err error) {
-	failure := operationFailure(err)
-	reason := "quota_unavailable"
-	if errors.Is(err, ErrNoFiveHourWindow) {
-		failure = FailureNone
-		reason = "five_hour_window_not_found"
-	} else if errors.Is(err, ErrInvalidUsage) {
-		reason = "quota_payload_invalid"
-	}
-	_ = store.Update(ctx, credentialID, func(current *CredentialState) {
-		current.Status = "skipped"
-		current.Reason = reason
-		current.LastError = safeErrorMessage(err.Error())
-		current.Skipped++
-		if failure == FailureAuth {
-			current.Status = "blocked"
-			current.BlockedCredentialVersion = version
-		}
-	})
-}
-
-func applyObservationDecision(state *CredentialState, observation Observation, decision WindowDecision) {
-	state.Provider = "codex"
-	state.CurrentResetAt = observation.ResetAt
-	copy := observation
-	state.LastObservation = &copy
-	if decision.ClearPending {
-		state.PendingTransition = nil
-	}
-	if decision.PendingTransition != nil {
-		transition := *decision.PendingTransition
-		state.PendingTransition = &transition
-	}
-	if decision.ClearStabilizing {
-		state.AwaitingStabilization = false
-	}
-	state.Status = string(decision.Kind)
-	state.Reason = decision.Reason
-	switch decision.Kind {
-	case DecisionExternal:
-		state.LastProcessedResetAt = decision.Boundary.UTC()
-		state.ActivationSource = "external"
-		state.NextRetryAt = time.Time{}
-		state.LastError = ""
-		state.Status = "waiting"
-		state.Skipped++
-	case DecisionWaiting:
-		state.Skipped++
-	}
 }
 
 func (r *Runtime) updateStatus(ctx context.Context, store *StateStore, credentialID, status, reason string, skipped bool) {
@@ -467,24 +579,6 @@ func (r *Runtime) ManualPing(ctx context.Context, request ManualPingRequest) (Ma
 	if err != nil {
 		return ManualPingResponse{}, err
 	}
-	var boundary time.Time
-	if request.MarkCycleProcessed {
-		observation, fetchErr := r.fetchObservation(ctx, material, r.now().UTC())
-		if fetchErr != nil {
-			return ManualPingResponse{}, fetchErr
-		}
-		state := store.Credential(credentialID)
-		decision := EvaluateObservation(state, observation, r.now().UTC(), cfg.ActivationDelay)
-		if decision.Kind != DecisionReady {
-			return ManualPingResponse{}, fmt.Errorf("current boundary is not ready: %s", decision.Reason)
-		}
-		boundary = decision.Boundary
-		if err := store.Update(ctx, credentialID, func(current *CredentialState) {
-			applyObservationDecision(current, observation, decision)
-		}); err != nil {
-			return ManualPingResponse{}, err
-		}
-	}
 	if model := strings.TrimSpace(request.Model); model != "" {
 		cfg.Model = model
 	}
@@ -501,9 +595,10 @@ func (r *Runtime) ManualPing(ctx context.Context, request ManualPingRequest) (Ma
 			current.LastError = ""
 			current.Successes++
 			if request.MarkCycleProcessed {
-				current.LastProcessedResetAt = boundary.UTC()
-				current.ActivationSource = "manual"
-				current.AwaitingStabilization = true
+				if target, key, ok := CurrentOrLatestMilestone(completedAt, cfg.Schedule, cfg.Location); ok {
+					current.LastProcessedMilestone = key
+					current.LastProcessedMilestoneAt = target.UTC()
+				}
 			}
 		} else {
 			current.LastAttemptStatus = "failed"

@@ -8,11 +8,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 )
 
 const (
-	codexUsageURL     = "https://chatgpt.com/backend-api/wham/usage"
 	codexResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
 	maxCapturedBody   = 64 * 1024
 )
@@ -54,35 +52,6 @@ func operationFailure(err error) FailureKind {
 		return typed.kind
 	}
 	return FailureTransport
-}
-
-func (r *Runtime) fetchObservation(ctx context.Context, material AuthMaterial, observedAt time.Time) (Observation, error) {
-	headers := http.Header{
-		"Accept":        {"application/json"},
-		"Authorization": {"Bearer " + material.AccessToken},
-		"OpenAI-Beta":   {"codex-1"},
-		"Originator":    {"codex_cli_rs"},
-	}
-	if material.AccountID != "" {
-		headers.Set("ChatGPT-Account-ID", material.AccountID)
-	}
-	response, err := r.host.HTTPDo(ctx, HTTPRequest{Method: http.MethodGet, URL: codexUsageURL, Headers: headers})
-	if err != nil {
-		return Observation{}, newOperationError(FailureTransport, "quota request failed")
-	}
-	switch {
-	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
-		return Observation{}, newOperationError(FailureAuth, "credential authentication failed")
-	case response.StatusCode >= 500:
-		return Observation{}, newOperationError(FailureRetryable, fmt.Sprintf("quota endpoint returned HTTP %d", response.StatusCode))
-	case response.StatusCode < 200 || response.StatusCode >= 300:
-		return Observation{}, newOperationError(FailureBusiness, fmt.Sprintf("quota endpoint returned HTTP %d", response.StatusCode))
-	}
-	observation, err := ParseFiveHourObservation(response.Body, observedAt)
-	if err != nil {
-		return Observation{}, err
-	}
-	return observation, nil
 }
 
 func (r *Runtime) activate(ctx context.Context, cfg Config, file AuthFile, material AuthMaterial) ActivationResult {

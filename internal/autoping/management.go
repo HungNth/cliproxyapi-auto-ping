@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -73,16 +75,22 @@ type managementResponse struct {
 }
 
 type statusPayload struct {
-	Plugin   string            `json:"plugin"`
-	Version  string            `json:"version"`
-	AutoPing statusConfig      `json:"auto_ping"`
-	Accounts []CredentialState `json:"accounts"`
+	Plugin          string            `json:"plugin"`
+	Version         string            `json:"version"`
+	Schedule        []string          `json:"schedule"`
+	Timezone        string            `json:"timezone"`
+	NextMilestoneAt string            `json:"next_milestone_at,omitempty"`
+	LastMilestone   string            `json:"last_milestone,omitempty"`
+	AutoPing        statusConfig      `json:"auto_ping"`
+	Accounts        []CredentialState `json:"accounts"`
 }
 
 type statusConfig struct {
 	Enabled                 bool     `json:"enabled"`
-	ScanInterval            string   `json:"scan_interval"`
-	ActivationDelay         string   `json:"activation_delay"`
+	Schedule                []string `json:"schedule"`
+	Timezone                string   `json:"timezone"`
+	NextMilestoneAt         string   `json:"next_milestone_at,omitempty"`
+	LastMilestone           string   `json:"last_milestone,omitempty"`
 	RetryCooldown           string   `json:"retry_cooldown"`
 	MaxConcurrency          int      `json:"max_concurrency"`
 	RequestTimeout          string   `json:"request_timeout"`
@@ -272,16 +280,29 @@ func (r *Runtime) handleManagement(ctx context.Context, raw []byte) (managementR
 func (r *Runtime) status() statusPayload {
 	cfg, store, _ := r.snapshot()
 	accounts := []CredentialState{}
+	var lastMilestone string
 	if store != nil {
 		accounts = store.Accounts()
+		lastMilestone = store.LastProcessedMilestone()
+	}
+	var nextMilestoneAt string
+	if cfg.AutoPingEnabled && len(cfg.Schedule) > 0 {
+		nextTime, _ := NextMilestone(r.now(), cfg.Schedule, cfg.Location)
+		nextMilestoneAt = nextTime.Format(time.RFC3339)
 	}
 	return statusPayload{
-		Plugin:  r.manifest.ID,
-		Version: r.manifest.Metadata.Version,
+		Plugin:          r.manifest.ID,
+		Version:         r.manifest.Metadata.Version,
+		Schedule:        slices.Clone(cfg.Schedule),
+		Timezone:        cfg.Timezone,
+		NextMilestoneAt: nextMilestoneAt,
+		LastMilestone:   lastMilestone,
 		AutoPing: statusConfig{
 			Enabled:                 cfg.AutoPingEnabled,
-			ScanInterval:            cfg.ScanInterval.String(),
-			ActivationDelay:         cfg.ActivationDelay.String(),
+			Schedule:                slices.Clone(cfg.Schedule),
+			Timezone:                cfg.Timezone,
+			NextMilestoneAt:         nextMilestoneAt,
+			LastMilestone:           lastMilestone,
 			RetryCooldown:           cfg.RetryCooldown.String(),
 			MaxConcurrency:          cfg.MaxConcurrency,
 			RequestTimeout:          cfg.RequestTimeout.String(),
