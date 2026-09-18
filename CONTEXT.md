@@ -12,29 +12,25 @@ _Avoid_: Account, auth file, token when referring to the managed record
 A Codex rolling session quota window whose declared duration is 18,000 seconds.
 _Avoid_: Long window, weekly quota, monthly quota
 
-**Reset Boundary**:
-The upstream `reset_at` timestamp associated with a Five-Hour Window. It is an observation from Codex, not a command that resets quota.
-_Avoid_: Forced reset, quota refresh
+**Schedule Milestone**:
+A configured daily wall-clock time (such as `05:00`) at which Auto-Ping triggers for all Eligible Credentials.
+_Avoid_: Cron tick, timer trigger, reset boundary
 
-**Window Observation**:
-A quota snapshot for one Codex Credential, including its Reset Boundary and usage state at a specific observation time.
-_Avoid_: Ping state, timer tick
+**Processed Milestone**:
+A Schedule Milestone on a given calendar day that has already been dispatched for a Codex Credential.
+_Avoid_: Processed reset, handled boundary
+
+**Milestone Catch-Up**:
+An Auto-Ping dispatched upon plugin startup for any Eligible Credential that has not yet processed the most recent elapsed Schedule Milestone of the day, provided startup is at least one hour before the next milestone.
+_Avoid_: Missed ping, replay, backfill
 
 **Auto-Ping**:
 A minimal real Codex inference request sent with one Codex Credential to start its next Five-Hour Window.
 _Avoid_: Quota increase, quota bypass, OAuth refresh
 
-**External Activation**:
-A Five-Hour Window started by normal traffic before Auto-Ping acts.
-_Avoid_: Auto-Ping success
-
 **Eligible Credential**:
-A Codex Credential that is active, not explicitly excluded, and has a trustworthy Five-Hour Window observation requiring activation.
+A Codex Credential that is active, not explicitly excluded, and not blocked due to authentication failure.
 _Avoid_: Every account, scheduler candidate
-
-**Processed Reset Boundary**:
-A Reset Boundary already handled by a successful Auto-Ping or confirmed External Activation and therefore not eligible again.
-_Avoid_: Attempted reset, failed ping
 
 **Plugin Manifest**:
 The canonical declaration of the plugin's identity, release metadata, and default runtime configuration.
