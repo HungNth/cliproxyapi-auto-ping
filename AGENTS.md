@@ -30,6 +30,8 @@ grill-with-docs
 
 Use `grill-me` instead of `grill-with-docs` only when persistent domain documentation is not desired.
 
+**Do not create Git commits without explicit user approval. This applies to all repository changes, including specs, ADRs, tickets, documentation, source code, tests, configuration, generated files, and fixes. Creating, editing, implementing, reviewing, testing, or validating changes does not imply approval to commit. Keep all changes uncommitted until the user explicitly authorizes the commit.**
+
 Keep requirement discovery, specification, and ticket decomposition in the primary OMP context.
 
 ### Ticket Design
@@ -44,6 +46,20 @@ Tickets should be self-contained vertical slices and include, where applicable:
 - parent specification.
 
 Do not turn tickets into implementation scripts with unnecessary file paths or line numbers.
+
+## Agent skills
+
+### Issue tracker
+
+Local markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default canonical roles (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout (`CONTEXT.md` and `docs/adr/` at repo root). See `docs/agents/domain.md`.
 
 ## Output style
 
@@ -61,17 +77,3 @@ The reader has ADHD. Shape every response so it can be acted on:
 10. Omit preambles and repeated recaps; include required acceptance or blocker reports.
 
 Exceptions: explain fully when asked to explain. Confirm before destructive actions. Use the active workflow's retry and escalation rules; outside such a workflow, stop after three failed fixes and name the doubtful assumption. Ask one focused question when a required decision cannot be resolved from repository evidence.
-
-## Agent skills
-
-### Issue tracker
-
-Issues and specs live as local markdown under `.scratch/<feature-slug>/`. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Five canonical triage roles use their default label strings. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
