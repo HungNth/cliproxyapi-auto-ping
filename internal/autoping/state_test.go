@@ -13,13 +13,17 @@ func TestStateSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resetAt := time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)
+	milestoneTime := time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)
+	milestoneKey := "2026-09-11#10:00"
 	if err := store.Update(t.Context(), "codex-a", func(state *CredentialState) {
-		state.LastProcessedResetAt = resetAt
-		state.LastPingAt = resetAt.Add(5 * time.Second)
-		state.ActivationSource = "auto_ping"
+		state.LastProcessedMilestone = milestoneKey
+		state.LastProcessedMilestoneAt = milestoneTime
+		state.LastPingAt = milestoneTime.Add(5 * time.Second)
 		state.Status = "waiting"
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetLastMilestone(t.Context(), milestoneKey); err != nil {
 		t.Fatal(err)
 	}
 
@@ -28,7 +32,10 @@ func TestStateSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := reloaded.Credential("codex-a")
-	if !state.LastProcessedResetAt.Equal(resetAt) || state.ActivationSource != "auto_ping" {
+	if state.LastProcessedMilestone != milestoneKey || !state.LastProcessedMilestoneAt.Equal(milestoneTime) {
 		t.Fatalf("reloaded state = %#v", state)
+	}
+	if reloaded.LastProcessedMilestone() != milestoneKey {
+		t.Fatalf("reloaded global milestone = %q, want %q", reloaded.LastProcessedMilestone(), milestoneKey)
 	}
 }

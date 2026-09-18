@@ -17,33 +17,32 @@ import (
 const stateVersion = 1
 
 type CredentialState struct {
-	CredentialID             string             `json:"credential_id"`
-	Provider                 string             `json:"provider"`
-	Status                   string             `json:"status"`
-	Reason                   string             `json:"reason,omitempty"`
-	CurrentResetAt           time.Time          `json:"current_reset_at,omitzero"`
-	LastObservation          *Observation       `json:"last_observation,omitempty"`
-	PendingTransition        *PendingTransition `json:"pending_transition,omitempty"`
-	LastProcessedResetAt     time.Time          `json:"last_processed_reset_at,omitzero"`
-	ActivationSource         string             `json:"activation_source,omitempty"`
-	AwaitingStabilization    bool               `json:"awaiting_stabilization,omitzero"`
-	LastAttemptAt            time.Time          `json:"last_attempt_at,omitzero"`
-	LastAttemptStatus        string             `json:"last_attempt_status,omitempty"`
-	LastPingAt               time.Time          `json:"last_ping_at,omitzero"`
-	LastError                string             `json:"last_error,omitempty"`
-	NextRetryAt              time.Time          `json:"next_retry_at,omitzero"`
-	BlockedCredentialVersion string             `json:"blocked_credential_version,omitempty"`
-	SelectedModel            string             `json:"selected_model,omitempty"`
-	Transport                string             `json:"transport,omitempty"`
-	Attempts                 uint64             `json:"attempts,omitzero"`
-	Successes                uint64             `json:"successes,omitzero"`
-	Failures                 uint64             `json:"failures,omitzero"`
-	Skipped                  uint64             `json:"skipped,omitzero"`
+	CredentialID             string    `json:"credential_id"`
+	Provider                 string    `json:"provider"`
+	Status                   string    `json:"status"`
+	Reason                   string    `json:"reason,omitempty"`
+	LastProcessedMilestone   string    `json:"last_processed_milestone,omitempty"`
+	LastProcessedMilestoneAt time.Time `json:"last_processed_milestone_at,omitzero"`
+	CurrentResetAt           time.Time `json:"current_reset_at,omitzero"`
+	LastAttemptAt            time.Time `json:"last_attempt_at,omitzero"`
+	LastAttemptStatus        string    `json:"last_attempt_status,omitempty"`
+	LastPingAt               time.Time `json:"last_ping_at,omitzero"`
+	LastError                string    `json:"last_error,omitempty"`
+	NextRetryAt              time.Time `json:"next_retry_at,omitzero"`
+	RetryCount               int       `json:"retry_count,omitzero"`
+	BlockedCredentialVersion string    `json:"blocked_credential_version,omitempty"`
+	SelectedModel            string    `json:"selected_model,omitempty"`
+	Transport                string    `json:"transport,omitempty"`
+	Attempts                 uint64    `json:"attempts,omitzero"`
+	Successes                uint64    `json:"successes,omitzero"`
+	Failures                 uint64    `json:"failures,omitzero"`
+	Skipped                  uint64    `json:"skipped,omitzero"`
 }
 
 type StateDocument struct {
-	Version     int                        `json:"version"`
-	Credentials map[string]CredentialState `json:"credentials"`
+	Version                int                        `json:"version"`
+	LastProcessedMilestone string                     `json:"last_processed_milestone,omitempty"`
+	Credentials            map[string]CredentialState `json:"credentials"`
 }
 
 type StateStore struct {
@@ -56,6 +55,19 @@ func (s *StateStore) Path() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.path
+}
+
+func (s *StateStore) LastProcessedMilestone() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.doc.LastProcessedMilestone
+}
+
+func (s *StateStore) SetLastMilestone(ctx context.Context, milestoneKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.doc.LastProcessedMilestone = milestoneKey
+	return s.saveLocked(ctx)
 }
 
 func LoadStateStore(ctx context.Context, path string) (*StateStore, error) {
@@ -173,13 +185,5 @@ func (s *StateStore) saveLocked(ctx context.Context) (resultErr error) {
 }
 
 func cloneCredentialState(state CredentialState) CredentialState {
-	if state.LastObservation != nil {
-		observation := *state.LastObservation
-		state.LastObservation = &observation
-	}
-	if state.PendingTransition != nil {
-		transition := *state.PendingTransition
-		state.PendingTransition = &transition
-	}
 	return state
 }
