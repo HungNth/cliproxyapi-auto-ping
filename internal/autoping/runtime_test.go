@@ -1,9 +1,11 @@
 package autoping
 
 import (
+	"errors"
 	"net/http"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -32,8 +34,8 @@ func TestScheduledMilestoneDispatchMultipleAccountsAndSurvivesRestart(t *testing
 	if err := runtime.DispatchMilestone(t.Context(), milestoneKey, clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if len(host.streamRequests) != 3 {
-		t.Fatalf("pings = %d, want 3", len(host.streamRequests))
+	if host.streamRequestCount() != 3 {
+		t.Fatalf("pings = %d, want 3", host.streamRequestCount())
 	}
 	if runtime.store.LastProcessedMilestone() != milestoneKey {
 		t.Fatalf("global last milestone = %q, want %q", runtime.store.LastProcessedMilestone(), milestoneKey)
@@ -49,8 +51,8 @@ func TestScheduledMilestoneDispatchMultipleAccountsAndSurvivesRestart(t *testing
 	if err := runtime.DispatchMilestone(t.Context(), milestoneKey, clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if len(host.streamRequests) != 3 {
-		t.Fatalf("duplicate milestone dispatch sent another ping: %d", len(host.streamRequests))
+	if host.streamRequestCount() != 3 {
+		t.Fatalf("duplicate milestone dispatch sent another ping: %d", host.streamRequestCount())
 	}
 
 	// Survives restart without duplicate pings
@@ -65,8 +67,8 @@ func TestScheduledMilestoneDispatchMultipleAccountsAndSurvivesRestart(t *testing
 	if err := restarted.DispatchMilestone(t.Context(), milestoneKey, clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if len(host.streamRequests) != 3 {
-		t.Fatalf("restart duplicated a processed milestone: %d", len(host.streamRequests))
+	if host.streamRequestCount() != 3 {
+		t.Fatalf("restart duplicated a processed milestone: %d", host.streamRequestCount())
 	}
 
 	// Advancing to next milestone dispatches new cycle
@@ -75,8 +77,273 @@ func TestScheduledMilestoneDispatchMultipleAccountsAndSurvivesRestart(t *testing
 	if err := restarted.DispatchMilestone(t.Context(), nextMilestone, clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if len(host.streamRequests) != 6 {
-		t.Fatalf("total pings = %d, want 6", len(host.streamRequests))
+	if host.streamRequestCount() != 6 {
+		t.Fatalf("total pings = %d, want 6", host.streamRequestCount())
+	}
+}
+
+func TestScheduleLoopPreservesMilestonesWhileBusy(t *testing.T) {
+	for _, retry := range []bool{false, true} {
+		name := "slow_batch"
+		if retry {
+			name = "slow_retry"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				host := newFakeHost()
+				for _, id := range []string{"codex-a", "codex-b"} {
+					file, document := credential(id, "token-"+id, 1)
+					host.auths = append(host.auths, file)
+					host.docs[file.AuthIndex] = document
+				}
+				requests := map[string]int{}
+				host.httpStreamFunc = func(request HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+					id := request.Headers.Get("ChatGPT-Account-ID")
+					requests[id]++
+					if retry && id == "account-codex-a" && requests[id] == 1 {
+						return HTTPStreamResponse{StatusCode: http.StatusInternalServerError}, []HTTPStreamChunk{{Done: true}}, nil
+					}
+					if !retry || (id == "account-codex-a" && requests[id] == 2) {
+						time.Sleep(40 * time.Second)
+					}
+					return successStream()
+				}
+				runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+				cfg := testConfig(t, runtime, "schedule: [\"00:01\", \"00:02\", \"05:00\"]\ntimezone: UTC\nmax_concurrency: 1\nretry_cooldown: 30s\nscheduler_boost_fallback: false\n")
+				cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+				if err := runtime.Configure(t.Context(), cfg); err != nil {
+					t.Fatal(err)
+				}
+				defer runtime.Shutdown(t.Context())
+
+				// Exercise the real timers, workers and retry loop; no direct dispatch calls.
+				time.Sleep(time.Minute)
+				synctest.Wait()
+				if retry {
+					failed := runtime.store.Credential("codex-a")
+					next := runtime.store.Credential("codex-b")
+					if failed.Failures != 1 || failed.Successes != 0 || next.LastProcessedMilestone != "2000-01-01#00:01" || next.Successes != 1 {
+						t.Fatalf("first failure blocked the next credential: first failures=%d successes=%d; next milestone=%q successes=%d", failed.Failures, failed.Successes, next.LastProcessedMilestone, next.Successes)
+					}
+				}
+				time.Sleep(3 * time.Minute)
+				synctest.Wait()
+				for _, id := range []string{"codex-a", "codex-b"} {
+					state := runtime.store.Credential(id)
+					if state.LastProcessedMilestone != "2000-01-01#00:02" || state.Successes != 2 {
+						t.Errorf("%s: processed %q, successes=%d; want both 00:01 and 00:02 milestones", id, state.LastProcessedMilestone, state.Successes)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestScheduleLoopRetriesUnavailableCredentialMaterial(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			return successStream()
+		}
+		runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+		cfg := testConfig(t, runtime, "schedule: [\"00:01\", \"05:00\"]\ntimezone: UTC\nretry_cooldown: 30s\n")
+		cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+		if err := runtime.Configure(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Shutdown(t.Context())
+
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		// The host can read the same credential again; no token refresh occurred.
+		host.mu.Lock()
+		host.docs[file.AuthIndex] = document
+		host.mu.Unlock()
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		state := runtime.store.Credential(file.ID)
+		if state.LastProcessedMilestone != "2000-01-01#00:01" || state.Successes != 1 {
+			t.Fatalf("recovered credential was not pinged: milestone=%q, successes=%d, reason=%s", state.LastProcessedMilestone, state.Successes, state.Reason)
+		}
+	})
+}
+
+func TestScheduleLoopWaitsForManualPing(t *testing.T) {
+	for _, mark := range []bool{false, true} {
+		name := "unmarked"
+		if mark {
+			name = "marked"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				host := newFakeHost()
+				file, document := credential("codex-a", "token-a", 1)
+				host.auths = []AuthFile{file}
+				host.docs[file.AuthIndex] = document
+				host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+					time.Sleep(40 * time.Second)
+					return successStream()
+				}
+				runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+				cfg := testConfig(t, runtime, "schedule: [\"00:01\", \"05:00\"]\ntimezone: UTC\n")
+				cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+				if err := runtime.Configure(t.Context(), cfg); err != nil {
+					t.Fatal(err)
+				}
+				defer runtime.Shutdown(t.Context())
+
+				time.Sleep(40 * time.Second)
+				go func() {
+					if _, err := runtime.ManualPing(t.Context(), ManualPingRequest{CredentialID: file.ID, MarkCycleProcessed: mark}); err != nil {
+						t.Errorf("manual ping: %v", err)
+					}
+				}()
+				time.Sleep(2 * time.Minute)
+				synctest.Wait()
+				want := uint64(2)
+				if mark {
+					want = 1
+				}
+				state := runtime.store.Credential(file.ID)
+				if state.LastProcessedMilestone != "2000-01-01#00:01" || state.Successes != want {
+					t.Fatalf("milestone overlapping manual ping: processed=%q, successes=%d; want 00:01, %d", state.LastProcessedMilestone, state.Successes, want)
+				}
+			})
+		})
+	}
+}
+
+func TestScheduleLoopReconfigurationCancelsOldTimer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.docs[file.AuthIndex] = document
+		host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			return successStream()
+		}
+		runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+		cfg := testConfig(t, runtime, "schedule: [\"00:01\", \"05:00\"]\ntimezone: UTC\n")
+		cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+		if err := runtime.Configure(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Shutdown(t.Context())
+		synctest.Wait()
+
+		updated := testConfig(t, runtime, "schedule: [\"07:02\", \"07:03\", \"07:04\"]\ntimezone: Asia/Ho_Chi_Minh\n")
+		updated.StatePath = cfg.StatePath
+		if err := runtime.Configure(t.Context(), updated); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if host.streamRequestCount() != 0 {
+			t.Fatal("obsolete UTC milestone still dispatched after reconfiguration")
+		}
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if state := runtime.store.Credential(file.ID); state.LastProcessedMilestone != "2000-01-01#07:02" {
+			t.Fatalf("new timezone/schedule did not dispatch: %q", state.LastProcessedMilestone)
+		}
+		updated.AutoPingEnabled = false
+		if err := runtime.Configure(t.Context(), updated); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if count := host.streamRequestCount(); count != 1 {
+			t.Fatalf("disabled timer dispatched: requests=%d", count)
+		}
+		updated.AutoPingEnabled = true
+		if err := runtime.Configure(t.Context(), updated); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if state := runtime.store.Credential(file.ID); state.LastProcessedMilestone != "2000-01-01#07:04" || state.Successes != 2 {
+			t.Fatalf("re-enabled schedule did not resume: processed=%q, successes=%d", state.LastProcessedMilestone, state.Successes)
+		}
+	})
+}
+
+func TestScheduleLoopRetriesCredentialListing(t *testing.T) {
+	for _, milestone := range []string{"00:00", "00:01"} {
+		t.Run(milestone, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				host := newFakeHost()
+				host.listErr = errors.New("host temporarily unavailable")
+				file, document := credential("codex-a", "token-a", 1)
+				host.auths = []AuthFile{file}
+				host.docs[file.AuthIndex] = document
+				host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+					return successStream()
+				}
+				runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+				cfg := testConfig(t, runtime, "schedule: [\""+milestone+"\", \"05:00\"]\ntimezone: UTC\nretry_cooldown: 30s\n")
+				cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+				if err := runtime.Configure(t.Context(), cfg); err != nil {
+					t.Fatal(err)
+				}
+				defer runtime.Shutdown(t.Context())
+				time.Sleep(time.Minute)
+				synctest.Wait()
+				host.mu.Lock()
+				host.listErr = nil
+				host.mu.Unlock()
+				time.Sleep(time.Minute)
+				synctest.Wait()
+				state := runtime.store.Credential(file.ID)
+				if state.LastProcessedMilestone != "2000-01-01#"+milestone || state.Successes != 1 {
+					t.Fatalf("milestone lost after listing recovered: processed=%q, successes=%d", state.LastProcessedMilestone, state.Successes)
+				}
+			})
+		})
+	}
+}
+
+func TestScheduleLoopReconfigurationCancelsQueuedCredentials(t *testing.T) {
+	for _, milestone := range []string{"00:01", "00:02"} {
+		t.Run(milestone, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				host := newFakeHost()
+				for _, id := range []string{"codex-a", "codex-b"} {
+					file, document := credential(id, "token-"+id, 1)
+					host.auths = append(host.auths, file)
+					host.docs[file.AuthIndex] = document
+				}
+				host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+					time.Sleep(40 * time.Second)
+					return successStream()
+				}
+				runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+				cfg := testConfig(t, runtime, "schedule: [\"00:01\", \"05:00\"]\ntimezone: UTC\nmax_concurrency: 1\n")
+				cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+				if err := runtime.Configure(t.Context(), cfg); err != nil {
+					t.Fatal(err)
+				}
+				defer runtime.Shutdown(t.Context())
+				time.Sleep(70 * time.Second)
+				synctest.Wait()
+				updated := testConfig(t, runtime, "schedule: [\""+milestone+"\", \"05:00\"]\ntimezone: UTC\nmax_concurrency: 1\nretry_cooldown: 30s\n")
+				updated.StatePath = cfg.StatePath
+				if err := runtime.Configure(t.Context(), updated); err != nil {
+					t.Fatal(err)
+				}
+				time.Sleep(3 * time.Minute)
+				synctest.Wait()
+				for _, id := range []string{"codex-a", "codex-b"} {
+					if state := runtime.store.Credential(id); state.LastProcessedMilestone != "2000-01-01#"+milestone {
+						t.Errorf("%s missed reconfigured milestone: %q", id, state.LastProcessedMilestone)
+					}
+				}
+				if count := host.streamRequestCount(); count != 3 {
+					t.Errorf("queued credential ran under canceled config: requests=%d, want one old in-flight plus two new", count)
+				}
+			})
+		})
 	}
 }
 
@@ -110,8 +377,8 @@ func TestScheduledMilestoneSkipsExcludedAndIneligibleCredentials(t *testing.T) {
 	if err := runtime.DispatchMilestone(t.Context(), milestoneKey, clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if len(host.streamRequests) != 1 {
-		t.Fatalf("pings = %d, want only active", len(host.streamRequests))
+	if host.streamRequestCount() != 1 {
+		t.Fatalf("pings = %d, want only active", host.streamRequestCount())
 	}
 	if state := runtime.store.Credential("codex-excluded"); state.Reason != "excluded" {
 		t.Fatalf("excluded state = %#v", state)
@@ -146,8 +413,8 @@ func TestScheduledMilestonePingsUnavailableCredential(t *testing.T) {
 	if err := runtime.DispatchMilestone(t.Context(), milestoneKey, clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if len(host.streamRequests) != 1 {
-		t.Fatalf("pings = %d, want 1 (scheduled milestone must re-test unavailable credential)", len(host.streamRequests))
+	if host.streamRequestCount() != 1 {
+		t.Fatalf("pings = %d, want 1 (scheduled milestone must re-test unavailable credential)", host.streamRequestCount())
 	}
 	state := runtime.store.Credential("codex-unavailable")
 	if state.LastProcessedMilestone != milestoneKey || state.Status != "waiting" || state.Reason != "milestone_ping_succeeded" {
@@ -178,8 +445,8 @@ func TestStartupCatchUpRunsWhenMoreThanOneHourBeforeNextMilestone(t *testing.T) 
 	// Give scheduleLoop a moment to run catch-up
 	time.Sleep(50 * time.Millisecond)
 
-	if len(host.streamRequests) != 1 {
-		t.Fatalf("catch-up pings = %d, want 1", len(host.streamRequests))
+	if host.streamRequestCount() != 1 {
+		t.Fatalf("catch-up pings = %d, want 1", host.streamRequestCount())
 	}
 	state := runtime.store.Credential("codex-a")
 	if state.LastProcessedMilestone != "2026-09-18#05:00" {
@@ -209,8 +476,8 @@ func TestStartupCatchUpSkippedWhenLessThanOneHourBeforeNextMilestone(t *testing.
 
 	time.Sleep(50 * time.Millisecond)
 
-	if len(host.streamRequests) != 0 {
-		t.Fatalf("catch-up pings = %d, want 0 (skipped due to < 1h threshold)", len(host.streamRequests))
+	if host.streamRequestCount() != 0 {
+		t.Fatalf("catch-up pings = %d, want 0 (skipped due to < 1h threshold)", host.streamRequestCount())
 	}
 }
 
@@ -242,8 +509,8 @@ func TestStartupCatchUpSkippedIfAlreadyProcessed(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	if len(host.streamRequests) != 0 {
-		t.Fatalf("catch-up pings = %d, want 0 because milestone was already processed", len(host.streamRequests))
+	if host.streamRequestCount() != 0 {
+		t.Fatalf("catch-up pings = %d, want 0 because milestone was already processed", host.streamRequestCount())
 	}
 }
 
@@ -285,8 +552,8 @@ func TestStartupCatchUpRunsForNewlyAvailableCredential(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Only codex-b should be pinged, codex-a skipped
-	if len(host.streamRequests) != 1 {
-		t.Fatalf("catch-up pings = %d, want 1 (for codex-b only)", len(host.streamRequests))
+	if host.streamRequestCount() != 1 {
+		t.Fatalf("catch-up pings = %d, want 1 (for codex-b only)", host.streamRequestCount())
 	}
 	stateA := runtime.store.Credential("codex-a")
 	if stateA.LastProcessedMilestone != "2026-09-18#05:00" {
@@ -319,8 +586,8 @@ func TestStartupCatchUpSkippedBeforeFirstMilestone(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	if len(host.streamRequests) != 0 {
-		t.Fatalf("catch-up pings = %d, want 0 before first milestone", len(host.streamRequests))
+	if host.streamRequestCount() != 0 {
+		t.Fatalf("catch-up pings = %d, want 0 before first milestone", host.streamRequestCount())
 	}
 }
 
@@ -608,12 +875,12 @@ func TestMilestoneAuthBlockImmediateAndUnblockOnVersionChange(t *testing.T) {
 
 	// Next milestone at 10:00: credential is still unchanged, so it should be skipped
 	clock.Advance(5 * time.Hour)
-	initialRequests := len(host.streamRequests)
+	initialRequests := host.streamRequestCount()
 	if err := runtime.DispatchMilestone(t.Context(), "2026-09-18#10:00", clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if len(host.streamRequests) != initialRequests {
-		t.Fatalf("auth-blocked credential was not skipped; requests = %d, want %d", len(host.streamRequests), initialRequests)
+	if host.streamRequestCount() != initialRequests {
+		t.Fatalf("auth-blocked credential was not skipped; requests = %d, want %d", host.streamRequestCount(), initialRequests)
 	}
 	state = runtime.store.Credential("codex-a")
 	if state.Status != "blocked" || state.Reason != "credential_unchanged_after_auth_failure" {
@@ -635,8 +902,8 @@ func TestMilestoneAuthBlockImmediateAndUnblockOnVersionChange(t *testing.T) {
 	if err := runtime.DispatchMilestone(t.Context(), "2026-09-18#15:00", clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if len(host.streamRequests) != initialRequests+1 {
-		t.Fatalf("unblocked credential did not receive request; requests = %d, want %d", len(host.streamRequests), initialRequests+1)
+	if host.streamRequestCount() != initialRequests+1 {
+		t.Fatalf("unblocked credential did not receive request; requests = %d, want %d", host.streamRequestCount(), initialRequests+1)
 	}
 	state = runtime.store.Credential("codex-a")
 	if state.Status != "waiting" || state.Reason != "milestone_ping_succeeded" {

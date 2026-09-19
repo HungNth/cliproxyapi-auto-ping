@@ -128,17 +128,32 @@ func (r *Runtime) scheduleLoop(ctx context.Context) {
 	if !sleepContext(ctx, r.startupDelay) {
 		return
 	}
-	r.startupCatchUp(ctx)
-
-	for {
-		cfg, store, ok := r.snapshot()
-		if !ok || !cfg.AutoPingEnabled {
-			return
+	// Configure cancels this loop and starts another with the new configuration.
+	cfg, store, ok := r.snapshot()
+	if !ok || !cfg.AutoPingEnabled {
+		return
+	}
+	now := r.now()
+	target, key := NextMilestone(now, cfg.Schedule, cfg.Location)
+	if latestTime, latestKey, hasLatest := CurrentOrLatestMilestone(now, cfg.Schedule, cfg.Location); hasLatest {
+		if target.Sub(now) >= time.Hour {
+			target, key = latestTime, latestKey
+			r.log(ctx, "info", "startup catch-up triggered", map[string]any{"milestone": latestKey})
+		} else {
+			r.log(ctx, "info", "startup catch-up skipped: next milestone is less than 1 hour away", map[string]any{
+				"latest_milestone": latestKey,
+				"next_milestone":   target.Format(time.RFC3339),
+			})
 		}
-		target, key := NextMilestone(r.now(), cfg.Schedule, cfg.Location)
-		if retryTime, hasRetry := r.nextRetryTime(store, r.now(), target); hasRetry {
+	}
+
+	for ctx.Err() == nil {
+		if retryTime, hasRetry := r.nextRetryTime(store, r.now(), target); hasRetry && r.now().Before(target) {
 			if !r.sleepUntil(ctx, retryTime) {
 				return
+			}
+			if !r.now().Before(target) {
+				continue
 			}
 			_ = r.dispatchRetries(ctx)
 			continue
@@ -146,7 +161,13 @@ func (r *Runtime) scheduleLoop(ctx context.Context) {
 		if !r.sleepUntil(ctx, target) {
 			return
 		}
-		_ = r.DispatchMilestone(ctx, key, target)
+		if err := r.DispatchMilestone(ctx, key, target); err != nil {
+			if !sleepContext(ctx, cfg.RetryCooldown) {
+				return
+			}
+			continue
+		}
+		target, key = NextMilestone(target, cfg.Schedule, cfg.Location)
 	}
 }
 
@@ -162,29 +183,6 @@ func (r *Runtime) sleepUntil(ctx context.Context, target time.Time) bool {
 		}
 	}
 	return true
-}
-
-func (r *Runtime) startupCatchUp(ctx context.Context) {
-	cfg, _, ok := r.snapshot()
-	if !ok || !cfg.AutoPingEnabled {
-		return
-	}
-	latestTime, latestKey, hasLatest := CurrentOrLatestMilestone(r.now(), cfg.Schedule, cfg.Location)
-	if !hasLatest {
-		return
-	}
-	nextTime, _ := NextMilestone(r.now(), cfg.Schedule, cfg.Location)
-	if nextTime.Sub(r.now()) < 1*time.Hour {
-		r.log(ctx, "info", "startup catch-up skipped: next milestone is less than 1 hour away", map[string]any{
-			"latest_milestone": latestKey,
-			"next_milestone":   nextTime.Format(time.RFC3339),
-		})
-		return
-	}
-	r.log(ctx, "info", "startup catch-up triggered", map[string]any{
-		"milestone": latestKey,
-	})
-	_ = r.DispatchMilestone(ctx, latestKey, latestTime)
 }
 
 func (r *Runtime) ScanOnce(ctx context.Context) error {
@@ -205,7 +203,7 @@ func (r *Runtime) DispatchMilestone(ctx context.Context, milestoneKey string, mi
 		return nil
 	}
 	if !r.scanRunning.CompareAndSwap(false, true) {
-		return nil
+		return errors.New("milestone dispatch already in progress")
 	}
 	defer r.scanRunning.Store(false)
 
@@ -411,26 +409,30 @@ func (r *Runtime) DispatchRetries(ctx context.Context) error {
 
 func (r *Runtime) dispatchCredentialMilestone(ctx context.Context, cfg Config, store *StateStore, file AuthFile, milestoneKey string, milestoneTime time.Time, isRetry bool) {
 	credentialID := file.CredentialID()
-	if _, loaded := r.inFlight.LoadOrStore(credentialID, struct{}{}); loaded {
+	done := make(chan struct{})
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		active, loaded := r.inFlight.LoadOrStore(credentialID, done)
+		if !loaded {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-active.(chan struct{}):
+		}
+	}
+	defer func() {
+		r.inFlight.Delete(credentialID)
+		close(done)
+	}()
+	if store.Credential(credentialID).LastProcessedMilestone == milestoneKey {
 		return
 	}
-	defer r.inFlight.Delete(credentialID)
 
 	credentialVersion := file.VersionKey()
-	document, material, err := r.credentialMaterial(ctx, file)
-	if err != nil {
-		_ = store.Update(ctx, credentialID, func(current *CredentialState) {
-			current.Status = "blocked"
-			current.Reason = "credential_unavailable"
-			current.LastError = "credential material unavailable"
-			current.BlockedCredentialVersion = credentialVersion
-			current.Skipped++
-		})
-		return
-	}
-	if file.Name == "" {
-		file.Name = document.Name
-	}
 
 	attemptAt := r.now().UTC()
 	_ = store.Update(ctx, credentialID, func(current *CredentialState) {
@@ -446,7 +448,14 @@ func (r *Runtime) dispatchCredentialMilestone(ctx context.Context, cfg Config, s
 	})
 	r.log(ctx, "info", "Codex scheduled auto-ping started", map[string]any{"credential": credentialID, "milestone": milestoneKey, "is_retry": isRetry})
 
-	result := r.activate(ctx, cfg, file, material)
+	document, material, err := r.credentialMaterial(ctx, file)
+	result := ActivationResult{Failure: FailureTransport, Message: "credential material unavailable"}
+	if err == nil {
+		if file.Name == "" {
+			file.Name = document.Name
+		}
+		result = r.activate(ctx, cfg, file, material)
+	}
 	completedAt := r.now().UTC()
 	if result.Success {
 		_ = store.Update(ctx, credentialID, func(current *CredentialState) {
@@ -591,10 +600,14 @@ func (r *Runtime) ManualPing(ctx context.Context, request ManualPingRequest) (Ma
 	if reason := ineligibleReason(cfg, file); reason != "" {
 		return ManualPingResponse{}, fmt.Errorf("credential is not eligible: %s", reason)
 	}
-	if _, loaded := r.inFlight.LoadOrStore(credentialID, struct{}{}); loaded {
+	done := make(chan struct{})
+	if _, loaded := r.inFlight.LoadOrStore(credentialID, done); loaded {
 		return ManualPingResponse{}, errors.New("credential already has an in-flight ping")
 	}
-	defer r.inFlight.Delete(credentialID)
+	defer func() {
+		r.inFlight.Delete(credentialID)
+		close(done)
+	}()
 
 	_, material, err := r.credentialMaterial(ctx, file)
 	if err != nil {

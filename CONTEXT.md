@@ -1,11 +1,11 @@
 # Codex Quota Auto-Ping
 
-This context defines how the plugin observes and activates Codex rolling five-hour quota windows without changing or bypassing upstream quota policy.
+This context defines scheduled Auto-Ping for Eligible Credentials at daily Schedule Milestones, without quota polling or changes to upstream quota policy.
 
 ## Language
 
 **Codex Credential**:
-A CLIProxyAPI-managed authentication record representing one upstream Codex account for quota observation and auto-ping.
+A CLIProxyAPI-managed authentication record representing one upstream Codex account for scheduled Auto-Ping.
 _Avoid_: Account, auth file, token when referring to the managed record
 
 **Five-Hour Window**:

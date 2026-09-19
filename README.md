@@ -1,6 +1,6 @@
 # CLIProxyAPI Codex 5h Auto-Ping
 
-A native [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that observes each Codex OAuth credential and sends one minimal, credential-targeted inference request when its rolling five-hour window is inactive.
+A native [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that sends one minimal, credential-targeted Codex inference request at each configured daily milestone.
 
 > Auto-Ping consumes a small amount of real Codex quota. It does not increase, reset, bypass, or create quota and does not change OpenAI subscription or rate-limit policy.
 
@@ -8,14 +8,17 @@ A native [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that
 
 For every eligible Codex credential, the plugin:
 
-1. reads the credential through `host.auth.list` and `host.auth.get`;
-2. fetches `https://chatgpt.com/backend-api/wham/usage` through `host.http.do`;
-3. identifies the five-hour window by `limit_window_seconds: 18000`, not by primary/secondary position;
-4. compares consecutive observations to distinguish an inactive sliding window from a window started by normal user traffic;
-5. sends a tiny streaming request directly to `https://chatgpt.com/backend-api/codex/responses` with that credential;
-6. persists the processed reset boundary atomically so restarts do not normally duplicate the ping.
+1. waits for the next daily milestone in the configured timezone (`05:00`, `10:00`, `15:00`, `20:00` by default);
+2. discovers credentials through `host.auth.list` and reads their material through `host.auth.get`, without pre-flight quota polling;
+3. sends a tiny streaming request directly to `https://chatgpt.com/backend-api/codex/responses` with each eligible credential, bounded by `max_concurrency`;
+4. waits for any manual ping already using that credential, then rechecks whether the milestone was processed;
+5. records each credential's successful milestone atomically so restarts do not normally duplicate the ping.
 
 A successful request is recorded only after a valid Codex response stream completes. If the process crashes after upstream success but before the state write, one rare duplicate is possible; pre-marking the cycle was rejected because it could silently lose the activation.
+
+While the plugin remains running, milestones reached during a slow batch or retry remain pending rather than being skipped. Requests may start later than the milestone when the worker pool is busy. A temporary credential-list failure keeps the milestone pending and retries discovery after `retry_cooldown`.
+
+On startup or reconfiguration, catch-up considers only today's most recent elapsed milestone. It dispatches unprocessed eligible credentials only when the next milestone is at least one hour away. Before today's first milestone, or less than one hour before the next one, it waits instead. Reconfiguration cancels the old timer and queued work before the replacement loop dispatches under the new settings; an already-running request may still need time to terminate.
 
 The plugins are independent and may be enabled together. This plugin does not modify `quota-activation` behavior or state.
 
@@ -68,18 +71,18 @@ An explicit model disables model fallback:
 model: "gpt-5.5"
 ```
 
-An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the plugin keeps the scanner stopped. Removing the key restores the default `false`.
+An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the plugin keeps the scheduler stopped. Removing the key restores the default `false`.
 
 ### Defaults
 
 | Field                      | Default                            | Meaning                                                    |
 | -------------------------- | ---------------------------------- | ---------------------------------------------------------- |
 | `auto_ping_disabled`       | `false`                            | Set to `true` to opt out of background inference requests  |
-| `schedule`                 | `["05:00", "10:00", "15:00", "20:00"]` | Daily reset milestone times in 24-hour format          |
+| `schedule`                 | `["05:00", "10:00", "15:00", "20:00"]` | Daily auto-ping milestone times in 24-hour format      |
 | `timezone`                 | `Local`                            | Timezone for daily schedule milestones                     |
 | `retry_cooldown`           | `2m`                               | Delay before retrying after an activation failure          |
 | `max_concurrency`          | `1`                                | Maximum credentials processed concurrently                 |
-| `request_timeout`          | `60s`                              | Quota/inference operation timeout                          |
+| `request_timeout`          | `60s`                              | Inference operation timeout                               |
 | `prompt`                   | `ping`                             | Minimal user input                                         |
 | `model`                    | `auto`                             | Uses `model_candidates`                                    |
 | `transport`                | `direct_http`                      | Guarantees the intended credential is used                 |
@@ -88,14 +91,15 @@ An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the p
 
 ## Eligibility and failure handling
 
-The scanner skips credentials that are disabled, unavailable, revoked, excluded, non-Codex, missing a five-hour window, cooling down, or already processed for the detected boundary.
+The scheduler skips disabled, revoked, explicitly excluded, non-Codex, and unchanged authentication-blocked credentials. The host's temporary `unavailable` flag alone does not exclude a credential. A successful milestone is deduplicated per credential, not by the global milestone marker.
 
-- Quota fetch failure: skip and retry on the next scan; never guess that a reset occurred.
-- Network/stream/temporary upstream failure: retry after `retry_cooldown`.
+- Credential material read failure, network/stream failure, or temporary upstream failure: retry after `retry_cooldown`, up to three total attempts per credential in the milestone cycle. The next milestone starts a new cycle.
 - Invalid authentication: block retries until CLIProxyAPI reports that the credential changed or refreshed.
 - Unsupported auto-selected model: try the next configured candidate once.
 - Explicit model failure: do not silently change models.
 - Direct business/authentication errors: never invoke scheduler fallback.
+
+Being scheduled guarantees an attempt under these eligibility rules, not upstream success. Exhausted retries or unchanged invalid authentication can leave a credential without a successful ping.
 
 `scheduler_boost_fallback` temporarily raises the target credential's priority, adds a one-time nonce, and accepts success only if the plugin scheduler confirms that CLIProxyAPI selected the intended credential. The original priority is restored from the latest credential document so a concurrent token refresh is not overwritten.
 
@@ -119,9 +123,9 @@ Manual ping body:
 }
 ```
 
-Manual pings do not alter the processed reset boundary unless `mark_cycle_processed` is true. When true, the current observation must already be eligible for automatic activation.
+Manual pings do not mark a milestone processed unless `mark_cycle_processed` is true. When true, a successful manual ping records the latest elapsed milestone of the current day. An overlapping automatic dispatch rechecks this marker before sending another request.
 
-Status and diagnostics expose credential IDs, reset timestamps, decisions, counters, selected model, transport, cooldown, and sanitized errors. Access tokens, refresh tokens, authorization headers, cookies, and raw credential JSON are never persisted or returned.
+Status and diagnostics expose credential IDs, milestone history, decisions, counters, selected model, transport, retry timing, and sanitized errors. The global `last_milestone` identifies the last evaluated batch; inspect each credential's `last_processed_milestone` and `last_attempt_status` to confirm success. Access tokens, refresh tokens, authorization headers, cookies, and raw credential JSON are never persisted or returned.
 
 ## Build
 
@@ -154,7 +158,7 @@ GitHub Actions builds Linux, macOS, and Windows release assets for amd64 and arm
 
 ## Security
 
-The plugin runs in-process and can read CLIProxyAPI-managed Codex credentials. Install only binaries you trust. Secrets are held only long enough to issue quota and inference requests through host callbacks; they are not written to plugin state or logs.
+The plugin runs in-process and can read CLIProxyAPI-managed Codex credentials. Install only binaries you trust. Secrets are held only long enough to issue inference requests through host callbacks; they are not written to plugin state or logs.
 
 ## References
 

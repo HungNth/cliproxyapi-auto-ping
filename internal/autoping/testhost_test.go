@@ -32,8 +32,9 @@ func (c *fakeClock) Advance(duration time.Duration) {
 type fakeHost struct {
 	mu sync.Mutex
 
-	auths []AuthFile
-	docs  map[string]AuthDocument
+	auths   []AuthFile
+	docs    map[string]AuthDocument
+	listErr error
 
 	httpDoFunc       func(HTTPRequest) (HTTPResponse, error)
 	httpStreamFunc   func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error)
@@ -55,6 +56,9 @@ func newFakeHost() *fakeHost {
 func (h *fakeHost) ListAuth(context.Context) ([]AuthFile, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.listErr != nil {
+		return nil, h.listErr
+	}
 	return slices.Clone(h.auths), nil
 }
 
@@ -113,6 +117,12 @@ func (h *fakeHost) HTTPDo(_ context.Context, request HTTPRequest) (HTTPResponse,
 		return HTTPResponse{}, errors.New("HTTPDo not configured")
 	}
 	return function(request)
+}
+
+func (h *fakeHost) streamRequestCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.streamRequests)
 }
 
 func (h *fakeHost) HTTPDoStream(_ context.Context, request HTTPRequest) (HTTPStreamResponse, error) {

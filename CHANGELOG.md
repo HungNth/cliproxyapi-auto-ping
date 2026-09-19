@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-09-19
+
+### Fixed
+
+- Preserve scheduled milestones when a preceding batch or retry runs past the next milestone instead of recalculating from the completion time and skipping it.
+- Retry temporary credential discovery/read failures without losing the milestone or permanently authentication-blocking a readable credential.
+- Wait for overlapping manual pings and recheck their processed milestone before automatic dispatch, preventing both missed and duplicate pings.
+- Cancel queued work on reconfiguration and retain catch-up when an older dispatch is still in flight.
+
 ## [0.1.2] - 2026-09-12
 
 ### Fixed
