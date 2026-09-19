@@ -10,7 +10,10 @@ import (
 	"time"
 )
 
-const scannerStartupDelay = 3 * time.Second
+const (
+	scannerStartupDelay = 3 * time.Second
+	maxSleepInterval    = 15 * time.Second
+)
 
 type Options struct {
 	Now          func() time.Time
@@ -134,21 +137,31 @@ func (r *Runtime) scheduleLoop(ctx context.Context) {
 		}
 		target, key := NextMilestone(r.now(), cfg.Schedule, cfg.Location)
 		if retryTime, hasRetry := r.nextRetryTime(store, r.now(), target); hasRetry {
-			for r.now().Before(retryTime) {
-				if !sleepContext(ctx, retryTime.Sub(r.now())) {
-					return
-				}
+			if !r.sleepUntil(ctx, retryTime) {
+				return
 			}
 			_ = r.dispatchRetries(ctx)
 			continue
 		}
-		for r.now().Before(target) {
-			if !sleepContext(ctx, target.Sub(r.now())) {
-				return
-			}
+		if !r.sleepUntil(ctx, target) {
+			return
 		}
 		_ = r.DispatchMilestone(ctx, key, target)
 	}
+}
+
+func (r *Runtime) sleepUntil(ctx context.Context, target time.Time) bool {
+	for r.now().Before(target) {
+		remaining := target.Sub(r.now())
+		if remaining <= 0 {
+			break
+		}
+		interval := min(remaining, maxSleepInterval)
+		if !sleepContext(ctx, interval) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Runtime) startupCatchUp(ctx context.Context) {
@@ -210,12 +223,14 @@ func (r *Runtime) DispatchMilestone(ctx context.Context, milestoneKey string, mi
 		}
 		if reason := ineligibleReason(cfg, file); reason != "" {
 			r.updateStatus(ctx, store, credentialID, "skipped", reason, true)
+			r.log(ctx, "info", "milestone credential skipped", map[string]any{"credential": credentialID, "milestone": milestoneKey, "reason": reason})
 			continue
 		}
 		state := store.Credential(credentialID)
 		credentialVersion := file.VersionKey()
 		if state.BlockedCredentialVersion != "" && state.BlockedCredentialVersion == credentialVersion {
 			r.updateStatus(ctx, store, credentialID, "blocked", "credential_unchanged_after_auth_failure", true)
+			r.log(ctx, "warn", "milestone credential blocked", map[string]any{"credential": credentialID, "milestone": milestoneKey, "reason": "credential_unchanged_after_auth_failure"})
 			continue
 		}
 		if state.BlockedCredentialVersion != "" {
@@ -225,6 +240,7 @@ func (r *Runtime) DispatchMilestone(ctx context.Context, milestoneKey string, mi
 			})
 		}
 		if state.LastProcessedMilestone == milestoneKey {
+			r.log(ctx, "info", "milestone credential already processed", map[string]any{"credential": credentialID, "milestone": milestoneKey})
 			continue
 		}
 		eligible = append(eligible, file)
@@ -232,8 +248,15 @@ func (r *Runtime) DispatchMilestone(ctx context.Context, milestoneKey string, mi
 
 	if len(eligible) == 0 {
 		_ = store.SetLastMilestone(ctx, milestoneKey)
+		r.log(ctx, "warn", "auto-ping milestone evaluated with zero eligible credentials", map[string]any{
+			"milestone": milestoneKey, "eligible": 0, "total": len(files),
+		})
 		return nil
 	}
+
+	r.log(ctx, "info", "auto-ping milestone dispatching credentials", map[string]any{
+		"milestone": milestoneKey, "eligible": len(eligible), "total": len(files),
+	})
 
 	workers := min(cfg.MaxConcurrency, len(eligible))
 	if workers < 1 {
@@ -521,8 +544,6 @@ func ineligibleReason(cfg Config, file AuthFile) string {
 		return "excluded"
 	case file.Disabled:
 		return "disabled"
-	case file.Unavailable:
-		return "unavailable"
 	case strings.EqualFold(file.Status, "disabled"), strings.EqualFold(file.Status, "revoked"):
 		return strings.ToLower(file.Status)
 	default:

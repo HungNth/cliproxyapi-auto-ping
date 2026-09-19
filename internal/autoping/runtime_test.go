@@ -121,6 +121,40 @@ func TestScheduledMilestoneSkipsExcludedAndIneligibleCredentials(t *testing.T) {
 	}
 }
 
+func TestScheduledMilestonePingsUnavailableCredential(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)}
+	host := newFakeHost()
+	unavail, docUnavail := credential("codex-unavailable", "token-unavail", 1)
+	unavail.Unavailable = true
+
+	host.auths = []AuthFile{unavail}
+	host.docs[unavail.AuthIndex] = docUnavail
+	host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+		return successStream()
+	}
+
+	startupDelay := 24 * time.Hour
+	runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
+	cfg := testConfig(t, runtime, "timezone: UTC\n")
+	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+	if err := runtime.Configure(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Shutdown(t.Context())
+
+	milestoneKey := "2026-09-18#10:00"
+	if err := runtime.DispatchMilestone(t.Context(), milestoneKey, clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if len(host.streamRequests) != 1 {
+		t.Fatalf("pings = %d, want 1 (scheduled milestone must re-test unavailable credential)", len(host.streamRequests))
+	}
+	state := runtime.store.Credential("codex-unavailable")
+	if state.LastProcessedMilestone != milestoneKey || state.Status != "waiting" || state.Reason != "milestone_ping_succeeded" {
+		t.Fatalf("unavailable credential state = %#v", state)
+	}
+}
+
 func TestStartupCatchUpRunsWhenMoreThanOneHourBeforeNextMilestone(t *testing.T) {
 	// 07:30 UTC is after 05:00 milestone, and 10:00 milestone is 2.5 hours away (>= 1 hour)
 	clock := &fakeClock{now: time.Date(2026, 9, 18, 7, 30, 0, 0, time.UTC)}
