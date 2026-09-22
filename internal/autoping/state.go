@@ -10,41 +10,37 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 )
 
-const stateVersion = 2
+const stateVersion = 3
 
 type CredentialState struct {
-	CredentialID             string    `json:"credential_id"`
-	Provider                 string    `json:"provider"`
-	Status                   string    `json:"status"`
-	Reason                   string    `json:"reason,omitempty"`
-	AttemptedMilestone       string    `json:"attempted_milestone,omitempty"`
-	FailureKind              string    `json:"failure_kind,omitempty"`
-	LastProcessedMilestone   string    `json:"last_processed_milestone,omitempty"`
-	LastProcessedMilestoneAt time.Time `json:"last_processed_milestone_at,omitzero"`
-	CurrentResetAt           time.Time `json:"current_reset_at,omitzero"`
-	LastAttemptAt            time.Time `json:"last_attempt_at,omitzero"`
-	LastAttemptStatus        string    `json:"last_attempt_status,omitempty"`
-	LastPingAt               time.Time `json:"last_ping_at,omitzero"`
-	LastError                string    `json:"last_error,omitempty"`
-	NextRetryAt              time.Time `json:"next_retry_at,omitzero"`
-	RetryCount               int       `json:"retry_count,omitzero"`
-	SelectedModel            string    `json:"selected_model,omitempty"`
-	Transport                string    `json:"transport,omitempty"`
-	Attempts                 uint64    `json:"attempts,omitzero"`
-	Successes                uint64    `json:"successes,omitzero"`
-	Failures                 uint64    `json:"failures,omitzero"`
-	Skipped                  uint64    `json:"skipped,omitzero"`
+	CredentialID         string    `json:"credential_id"`
+	Provider             string    `json:"provider"`
+	Status               string    `json:"status"`
+	Reason               string    `json:"reason,omitempty"`
+	FailureKind          string    `json:"failure_kind,omitempty"`
+	ObservedResetAt      time.Time `json:"observed_reset_at,omitzero"`
+	TargetTriggerAt      time.Time `json:"target_trigger_at,omitzero"`
+	LastProcessedResetAt time.Time `json:"last_processed_reset_at,omitzero"`
+	LastAttemptAt        time.Time `json:"last_attempt_at,omitzero"`
+	LastAttemptStatus    string    `json:"last_attempt_status,omitempty"`
+	LastPingAt           time.Time `json:"last_ping_at,omitzero"`
+	LastError            string    `json:"last_error,omitempty"`
+	NextRetryAt          time.Time `json:"next_retry_at,omitzero"`
+	RetryCount           int       `json:"retry_count,omitzero"`
+	SelectedModel        string    `json:"selected_model,omitempty"`
+	Transport            string    `json:"transport,omitempty"`
+	Attempts             uint64    `json:"attempts,omitzero"`
+	Successes            uint64    `json:"successes,omitzero"`
+	Failures             uint64    `json:"failures,omitzero"`
 }
 
 type StateDocument struct {
-	Version                int                        `json:"version"`
-	LastProcessedMilestone string                     `json:"last_processed_milestone,omitempty"`
-	Credentials            map[string]CredentialState `json:"credentials"`
+	Version     int                        `json:"version"`
+	Credentials map[string]CredentialState `json:"credentials"`
 }
 
 type StateStore struct {
@@ -57,80 +53,6 @@ func (s *StateStore) Path() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.path
-}
-
-func (s *StateStore) LastProcessedMilestone() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.doc.LastProcessedMilestone
-}
-
-func (s *StateStore) SetLastMilestone(ctx context.Context, milestoneKey string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	oldMilestone := s.doc.LastProcessedMilestone
-	s.doc.LastProcessedMilestone = milestoneKey
-	if err := s.saveLocked(ctx); err != nil {
-		s.doc.LastProcessedMilestone = oldMilestone
-		return err
-	}
-	return nil
-}
-
-func (s *StateStore) ResetCurrentCycles(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	oldCredentials := maps.Clone(s.doc.Credentials)
-	changed := false
-	for id, state := range s.doc.Credentials {
-		if !state.NextRetryAt.IsZero() || state.RetryCount != 0 || state.AttemptedMilestone != "" || state.FailureKind != "" {
-			state.NextRetryAt = time.Time{}
-			state.RetryCount = 0
-			state.AttemptedMilestone = ""
-			state.FailureKind = ""
-			if state.Status == "cooldown" || state.Status == "in_flight" {
-				state.Status = "waiting"
-			}
-			s.doc.Credentials[id] = state
-			changed = true
-		}
-	}
-	if !changed {
-		return nil
-	}
-	if err := s.saveLocked(ctx); err != nil {
-		s.doc.Credentials = oldCredentials
-		return err
-	}
-	return nil
-}
-func (s *StateStore) ResetStaleCycles(ctx context.Context, currentDate string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	oldCredentials := maps.Clone(s.doc.Credentials)
-	changed := false
-	for id, state := range s.doc.Credentials {
-		attemptDate, _, ok := strings.Cut(state.AttemptedMilestone, "#")
-		if ok && attemptDate != "" && attemptDate < currentDate {
-			state.NextRetryAt = time.Time{}
-			state.RetryCount = 0
-			state.AttemptedMilestone = ""
-			state.FailureKind = ""
-			if state.Status == "cooldown" || state.Status == "in_flight" {
-				state.Status = "waiting"
-			}
-			s.doc.Credentials[id] = state
-			changed = true
-		}
-	}
-	if !changed {
-		return nil
-	}
-	if err := s.saveLocked(ctx); err != nil {
-		s.doc.Credentials = oldCredentials
-		return err
-	}
-	return nil
 }
 
 func LoadStateStore(ctx context.Context, path string) (*StateStore, error) {
@@ -152,7 +74,7 @@ func LoadStateStore(ctx context.Context, path string) (*StateStore, error) {
 		return nil, fmt.Errorf("decode state: %w", err)
 	}
 	if store.doc.Version != stateVersion {
-		return nil, fmt.Errorf("decode state: unsupported version %d", store.doc.Version)
+		return nil, fmt.Errorf("decode state: unsupported state schema version: please remove stale state file (found version %d)", store.doc.Version)
 	}
 	if store.doc.Credentials == nil {
 		store.doc.Credentials = map[string]CredentialState{}
