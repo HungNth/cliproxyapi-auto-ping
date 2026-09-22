@@ -2,7 +2,7 @@ schema_version: 1
 id: "cliproxyapi-auto-ping"
 metadata:
   name: "Codex 5h Auto-Ping"
-  version: "0.2.2"
+  version: "0.2.3"
   author: "HungNth"
   github_repository: "https://github.com/HungNth/cliproxyapi-auto-ping"
   description: "Sends minimal targeted Codex requests at configured daily milestones."
