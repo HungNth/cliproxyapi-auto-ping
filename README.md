@@ -157,6 +157,30 @@ Then enable the plugin configuration and restart or reload CLIProxyAPI. Confirm 
 
 GitHub Actions builds Linux, macOS, and Windows release assets for amd64 and arm64. Release ZIP files are named `cliproxyapi-auto-ping_<version>_<os>_<arch>.zip`, contain `cliproxyapi-auto-ping.<ext>` at the archive root, and are accompanied by `checksums.txt`, matching CLIProxyAPI plugin-store installation format.
 
+## Installation on Linux
+
+A public installer script is provided for Linux glibc systems (`amd64` and `arm64`). It automatically resolves the latest release asset, verifies its SHA-256 checksum from `checksums.txt`, and atomically installs `cliproxyapi-auto-ping.so` into your existing CLIProxyAPI installation (`~/cliproxyapi/plugins/linux/<arch>/cliproxyapi-auto-ping.so`).
+
+### Prerequisites
+
+- Linux with glibc (Alpine/musl and OpenWrt are unsupported).
+- Existing CLIProxyAPI installation at `~/cliproxyapi`.
+- Standard tools installed: `bash`, `curl` (or `wget`), `unzip`, and `sha256sum`.
+
+### One-line install or upgrade
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HungNth/cliproxyapi-auto-ping/main/scripts/install/linux.sh | bash
+```
+
+Or run from a cloned repository:
+
+```bash
+bash scripts/install/linux.sh
+```
+
+After installation, restart or reload your CLIProxyAPI instance to load the updated plugin library.
+
 ## Security
 
 The plugin runs in-process and can read CLIProxyAPI-managed Codex credentials. Install only binaries you trust. Secrets are held only long enough to issue inference requests through host callbacks; they are not written to plugin state or logs.

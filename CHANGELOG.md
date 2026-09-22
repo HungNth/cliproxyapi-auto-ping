@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Retry recoverable Auto-Ping failures (timeouts, transport, HTTP 429, 5xx) with 1-minute default cooldown and upstream `Retry-After` header support until success, the next milestone, midnight in the configured timezone, or reconfiguration.
 - Distinguish current-cycle attempted milestone and failure classification from success-only processed milestones in state document v2.
+- Public Linux plugin installer script (`scripts/install/linux.sh`) to automatically resolve the latest release, verify SHA-256 checksums, and atomically install the plugin library to `~/cliproxyapi/plugins/linux/<arch>/cliproxyapi-auto-ping.so`.
 
 ### Changed
 
