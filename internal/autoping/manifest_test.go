@@ -15,14 +15,14 @@ metadata:
   version: "0.1.0"
   author: "HungNth"
   github_repository: "https://github.com/HungNth/cliproxyapi-auto-ping"
-  description: "Sends minimal targeted Codex requests at configured daily milestones."
+  description: "Sends minimal targeted Codex requests to roll 5-hour quota windows based on upstream reset observations."
   config_fields:
     - name: auto_ping_disabled
       type: boolean
       description: "Set to true to disable background Codex inference requests."
     - name: schedule
       type: array
-      description: "List of daily auto-ping milestone times in 24-hour HH:MM format, e.g. 05:00, 10:00, 15:00, 20:00."
+      description: "Daily milestone times in 24-hour HH:MM format: the first anchors initial discovery, and later entries start fresh cycles after terminal failures."
     - name: timezone
       type: string
       description: "Timezone for schedule milestones, e.g. Local, UTC, or Asia/Ho_Chi_Minh."

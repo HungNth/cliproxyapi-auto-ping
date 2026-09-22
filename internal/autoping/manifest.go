@@ -48,7 +48,7 @@ type manifestDocument struct {
 }
 
 var manifestFieldTypes = map[string]string{
-	"auto_ping_disabled":        "boolean",
+	"auto_ping_disabled":       "boolean",
 	"schedule":                 "array",
 	"timezone":                 "string",
 	"retry_cooldown":           "string",
