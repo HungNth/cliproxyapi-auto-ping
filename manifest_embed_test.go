@@ -29,8 +29,8 @@ func TestEmbeddedManifestMatchesPackagingContract(t *testing.T) {
 	if manifest.Defaults.Timezone != "Local" {
 		t.Fatalf("defaults timezone = %q", manifest.Defaults.Timezone)
 	}
-	if manifest.Defaults.RetryCooldown != 2*time.Minute {
-		t.Fatalf("defaults retry_cooldown = %v, want 2m", manifest.Defaults.RetryCooldown)
+	if manifest.Defaults.RetryCooldown != time.Minute {
+		t.Fatalf("defaults retry_cooldown = %v, want 1m", manifest.Defaults.RetryCooldown)
 	}
 
 	foundDisabledField := false

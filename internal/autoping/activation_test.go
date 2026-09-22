@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDirectActivationTargetsCredentialAndFallsBackModelOnce(t *testing.T) {
@@ -42,14 +43,33 @@ func TestDirectActivationTargetsCredentialAndFallsBackModelOnce(t *testing.T) {
 	}
 }
 
+func TestDirectActivationPreservesRetryAfterWhenStreamReadFails(t *testing.T) {
+	host := newFakeHost()
+	host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+		return HTTPStreamResponse{
+			StatusCode: http.StatusServiceUnavailable,
+			Headers:    http.Header{"Retry-After": {"120"}},
+		}, []HTTPStreamChunk{{Error: "stream interrupted", Done: true}}, nil
+	}
+	runtime := newTestRuntime(t, host, Options{})
+	cfg := testConfig(t, runtime, "scheduler_boost_fallback: false\n")
+	result := runtime.directActivate(t.Context(), cfg, AuthMaterial{AccessToken: "token-a"}, "gpt-5.5")
+	if result.Failure != FailureTransport {
+		t.Fatalf("failure = %q, want transport", result.Failure)
+	}
+	if result.RetryAfter == nil || *result.RetryAfter != 2*time.Minute {
+		t.Fatalf("retry_after = %v, want 2m", result.RetryAfter)
+	}
+}
+
 func TestEvaluateCodexResponseSurfacesUpstreamDetail(t *testing.T) {
 	tests := []struct {
-		name       string
-		status     int
-		body       string
-		wantSucc   bool
-		wantFail   FailureKind
-		wantMsg    string
+		name     string
+		status   int
+		body     string
+		wantSucc bool
+		wantFail FailureKind
+		wantMsg  string
 	}{
 		{
 			name:     "detail field in 400",

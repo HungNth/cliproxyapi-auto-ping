@@ -10,17 +10,20 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
 
-const stateVersion = 1
+const stateVersion = 2
 
 type CredentialState struct {
 	CredentialID             string    `json:"credential_id"`
 	Provider                 string    `json:"provider"`
 	Status                   string    `json:"status"`
 	Reason                   string    `json:"reason,omitempty"`
+	AttemptedMilestone       string    `json:"attempted_milestone,omitempty"`
+	FailureKind              string    `json:"failure_kind,omitempty"`
 	LastProcessedMilestone   string    `json:"last_processed_milestone,omitempty"`
 	LastProcessedMilestoneAt time.Time `json:"last_processed_milestone_at,omitzero"`
 	CurrentResetAt           time.Time `json:"current_reset_at,omitzero"`
@@ -30,7 +33,6 @@ type CredentialState struct {
 	LastError                string    `json:"last_error,omitempty"`
 	NextRetryAt              time.Time `json:"next_retry_at,omitzero"`
 	RetryCount               int       `json:"retry_count,omitzero"`
-	BlockedCredentialVersion string    `json:"blocked_credential_version,omitempty"`
 	SelectedModel            string    `json:"selected_model,omitempty"`
 	Transport                string    `json:"transport,omitempty"`
 	Attempts                 uint64    `json:"attempts,omitzero"`
@@ -66,8 +68,69 @@ func (s *StateStore) LastProcessedMilestone() string {
 func (s *StateStore) SetLastMilestone(ctx context.Context, milestoneKey string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	oldMilestone := s.doc.LastProcessedMilestone
 	s.doc.LastProcessedMilestone = milestoneKey
-	return s.saveLocked(ctx)
+	if err := s.saveLocked(ctx); err != nil {
+		s.doc.LastProcessedMilestone = oldMilestone
+		return err
+	}
+	return nil
+}
+
+func (s *StateStore) ResetCurrentCycles(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldCredentials := maps.Clone(s.doc.Credentials)
+	changed := false
+	for id, state := range s.doc.Credentials {
+		if !state.NextRetryAt.IsZero() || state.RetryCount != 0 || state.AttemptedMilestone != "" || state.FailureKind != "" {
+			state.NextRetryAt = time.Time{}
+			state.RetryCount = 0
+			state.AttemptedMilestone = ""
+			state.FailureKind = ""
+			if state.Status == "cooldown" || state.Status == "in_flight" {
+				state.Status = "waiting"
+			}
+			s.doc.Credentials[id] = state
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.saveLocked(ctx); err != nil {
+		s.doc.Credentials = oldCredentials
+		return err
+	}
+	return nil
+}
+func (s *StateStore) ResetStaleCycles(ctx context.Context, currentDate string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldCredentials := maps.Clone(s.doc.Credentials)
+	changed := false
+	for id, state := range s.doc.Credentials {
+		attemptDate, _, ok := strings.Cut(state.AttemptedMilestone, "#")
+		if ok && attemptDate != "" && attemptDate < currentDate {
+			state.NextRetryAt = time.Time{}
+			state.RetryCount = 0
+			state.AttemptedMilestone = ""
+			state.FailureKind = ""
+			if state.Status == "cooldown" || state.Status == "in_flight" {
+				state.Status = "waiting"
+			}
+			s.doc.Credentials[id] = state
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.saveLocked(ctx); err != nil {
+		s.doc.Credentials = oldCredentials
+		return err
+	}
+	return nil
 }
 
 func LoadStateStore(ctx context.Context, path string) (*StateStore, error) {
@@ -109,14 +172,19 @@ func (s *StateStore) Credential(id string) CredentialState {
 func (s *StateStore) Update(ctx context.Context, id string, update func(*CredentialState)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	state := cloneCredentialState(s.doc.Credentials[id])
+	oldState := cloneCredentialState(s.doc.Credentials[id])
+	state := oldState
 	state.CredentialID = id
 	if state.Provider == "" {
 		state.Provider = "codex"
 	}
 	update(&state)
 	s.doc.Credentials[id] = state
-	return s.saveLocked(ctx)
+	if err := s.saveLocked(ctx); err != nil {
+		s.doc.Credentials[id] = oldState
+		return err
+	}
+	return nil
 }
 
 func (s *StateStore) Snapshot() StateDocument {

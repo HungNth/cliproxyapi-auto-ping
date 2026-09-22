@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -34,6 +36,26 @@ type ActivationResult struct {
 	StatusCode int
 	Failure    FailureKind
 	Message    string
+	RetryAfter *time.Duration
+}
+
+func parseRetryAfter(header string, now time.Time) *time.Duration {
+	trimmed := strings.TrimSpace(header)
+	if trimmed == "" {
+		return nil
+	}
+	if seconds, err := strconv.Atoi(trimmed); err == nil && seconds >= 0 {
+		d := time.Duration(seconds) * time.Second
+		return &d
+	}
+	if parsedTime, err := http.ParseTime(trimmed); err == nil {
+		diff := parsedTime.Sub(now)
+		if diff < 0 {
+			diff = 0
+		}
+		return &diff
+	}
+	return nil
 }
 
 type operationError struct {
@@ -118,8 +140,12 @@ func (r *Runtime) directActivate(ctx context.Context, cfg Config, material AuthM
 		}
 		return ActivationResult{Model: model, Transport: TransportDirectHTTP, Failure: failure, Message: "Codex transport failed"}
 	}
+	var retryAfter *time.Duration
+	if stream.Headers != nil {
+		retryAfter = parseRetryAfter(stream.Headers.Get("Retry-After"), r.now())
+	}
 	if stream.StreamID == "" {
-		return ActivationResult{Model: model, Transport: TransportDirectHTTP, StatusCode: stream.StatusCode, Failure: FailureTransport, Message: "Codex stream bridge unavailable"}
+		return ActivationResult{Model: model, Transport: TransportDirectHTTP, StatusCode: stream.StatusCode, Failure: FailureTransport, Message: "Codex stream bridge unavailable", RetryAfter: retryAfter}
 	}
 	body, readErr := r.drainHTTPStream(requestCtx, stream.StreamID)
 	if readErr != nil {
@@ -127,12 +153,13 @@ func (r *Runtime) directActivate(ctx context.Context, cfg Config, material AuthM
 		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
 			failure = FailureTimeout
 		}
-		return ActivationResult{Model: model, Transport: TransportDirectHTTP, StatusCode: stream.StatusCode, Failure: failure, Message: "Codex stream failed"}
+		return ActivationResult{Model: model, Transport: TransportDirectHTTP, StatusCode: stream.StatusCode, Failure: failure, Message: "Codex stream failed", RetryAfter: retryAfter}
 	}
 	success, failure, message := evaluateCodexResponse(stream.StatusCode, body)
 	return ActivationResult{
 		Success: success, Model: model, Transport: TransportDirectHTTP,
 		StatusCode: stream.StatusCode, Failure: failure, Message: message,
+		RetryAfter: retryAfter,
 	}
 }
 
@@ -180,7 +207,7 @@ func evaluateCodexResponse(statusCode int, body []byte) (bool, FailureKind, stri
 		switch {
 		case statusCode == http.StatusBadRequest || statusCode == http.StatusNotFound || isModelFailure(body):
 			return false, FailureModel, message
-		case statusCode >= 500:
+		case statusCode == http.StatusTooManyRequests || statusCode >= 500:
 			return false, FailureRetryable, message
 		default:
 			return false, FailureBusiness, message

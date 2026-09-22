@@ -36,17 +36,17 @@ type fakeHost struct {
 	docs    map[string]AuthDocument
 	listErr error
 
-	httpDoFunc       func(HTTPRequest) (HTTPResponse, error)
-	httpStreamFunc   func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error)
-	modelExecuteFunc func(ModelExecuteRequest) (ModelExecuteResponse, error)
-
-	streams        map[string][]HTTPStreamChunk
-	nextStreamID   int
-	httpRequests   []HTTPRequest
-	streamRequests []HTTPRequest
-	modelRequests  []ModelExecuteRequest
-	saveCalls      int
-	logs           []LogRequest
+	httpDoFunc            func(HTTPRequest) (HTTPResponse, error)
+	httpStreamFunc        func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error)
+	httpStreamContextFunc func(context.Context, HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error)
+	modelExecuteFunc      func(ModelExecuteRequest) (ModelExecuteResponse, error)
+	streams               map[string][]HTTPStreamChunk
+	nextStreamID          int
+	httpRequests          []HTTPRequest
+	streamRequests        []HTTPRequest
+	modelRequests         []ModelExecuteRequest
+	saveCalls             int
+	logs                  []LogRequest
 }
 
 func newFakeHost() *fakeHost {
@@ -125,15 +125,23 @@ func (h *fakeHost) streamRequestCount() int {
 	return len(h.streamRequests)
 }
 
-func (h *fakeHost) HTTPDoStream(_ context.Context, request HTTPRequest) (HTTPStreamResponse, error) {
+func (h *fakeHost) HTTPDoStream(ctx context.Context, request HTTPRequest) (HTTPStreamResponse, error) {
 	h.mu.Lock()
 	h.streamRequests = append(h.streamRequests, request)
+	contextFunction := h.httpStreamContextFunc
 	function := h.httpStreamFunc
 	h.mu.Unlock()
-	if function == nil {
+	if contextFunction == nil && function == nil {
 		return HTTPStreamResponse{}, errors.New("HTTPDoStream not configured")
 	}
-	response, chunks, err := function(request)
+	var response HTTPStreamResponse
+	var chunks []HTTPStreamChunk
+	var err error
+	if contextFunction != nil {
+		response, chunks, err = contextFunction(ctx, request)
+	} else {
+		response, chunks, err = function(request)
+	}
 	if err != nil {
 		return HTTPStreamResponse{}, err
 	}

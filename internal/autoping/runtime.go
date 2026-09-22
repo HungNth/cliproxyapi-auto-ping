@@ -25,6 +25,7 @@ type Runtime struct {
 	now      func() time.Time
 	manifest Manifest
 
+	configMu      sync.Mutex
 	mu            sync.RWMutex
 	config        Config
 	store         *StateStore
@@ -66,9 +67,18 @@ func NewRuntime(host Host, manifestData []byte, options Options) (*Runtime, erro
 }
 
 func (r *Runtime) Configure(ctx context.Context, cfg Config) error {
+	r.configMu.Lock()
+	defer r.configMu.Unlock()
+
 	r.mu.RLock()
 	currentStore := r.store
+	isShutdown := r.shutdown
 	r.mu.RUnlock()
+
+	if isShutdown {
+		return errors.New("runtime is shut down")
+	}
+
 	store := currentStore
 	if store == nil || store.Path() != cfg.StatePath {
 		loaded, err := LoadStateStore(ctx, cfg.StatePath)
@@ -79,11 +89,43 @@ func (r *Runtime) Configure(ctx context.Context, cfg Config) error {
 	}
 
 	r.mu.Lock()
+	if r.shutdown {
+		r.mu.Unlock()
+		return errors.New("runtime is shut down")
+	}
+	oldCancel := r.scannerCancel
+	r.mu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+		waitDone := make(chan struct{})
+		go func() {
+			r.scannerWG.Wait()
+			close(waitDone)
+		}()
+		select {
+		case <-ctx.Done():
+			r.mu.Lock()
+			r.config.AutoPingEnabled = false
+			r.mu.Unlock()
+			return ctx.Err()
+		case <-waitDone:
+			r.mu.Lock()
+			r.scannerCancel = nil
+			r.mu.Unlock()
+		}
+	}
+	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.shutdown {
 		return errors.New("runtime is shut down")
 	}
-	r.stopScannerLocked()
+	reconfigured := currentStore != nil
+	if store != nil && reconfigured {
+		if err := store.ResetCurrentCycles(ctx); err != nil {
+			return err
+		}
+	}
 	r.config = cfg
 	r.store = store
 	if cfg.AutoPingEnabled {
@@ -101,9 +143,13 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	r.shutdown = true
-	r.stopScannerLocked()
+	oldCancel := r.scannerCancel
+	r.scannerCancel = nil
 	r.mu.Unlock()
 
+	if oldCancel != nil {
+		oldCancel()
+	}
 	done := make(chan struct{})
 	go func() {
 		r.scannerWG.Wait()
@@ -117,13 +163,6 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (r *Runtime) stopScannerLocked() {
-	if r.scannerCancel != nil {
-		r.scannerCancel()
-		r.scannerCancel = nil
-	}
-}
-
 func (r *Runtime) scheduleLoop(ctx context.Context) {
 	if !sleepContext(ctx, r.startupDelay) {
 		return
@@ -134,40 +173,110 @@ func (r *Runtime) scheduleLoop(ctx context.Context) {
 		return
 	}
 	now := r.now()
-	target, key := NextMilestone(now, cfg.Schedule, cfg.Location)
-	if latestTime, latestKey, hasLatest := CurrentOrLatestMilestone(now, cfg.Schedule, cfg.Location); hasLatest {
-		if target.Sub(now) >= time.Hour {
-			target, key = latestTime, latestKey
-			r.log(ctx, "info", "startup catch-up triggered", map[string]any{"milestone": latestKey})
-		} else {
-			r.log(ctx, "info", "startup catch-up skipped: next milestone is less than 1 hour away", map[string]any{
-				"latest_milestone": latestKey,
-				"next_milestone":   target.Format(time.RFC3339),
-			})
+	loc := cfg.Location
+	if loc == nil {
+		loc = time.Local
+	}
+	nextTarget, nextKey := NextMilestone(now, cfg.Schedule, cfg.Location)
+	target, key := nextTarget, nextKey
+	activeAttemptedKey := key
+	priorAttemptedDate := now.In(loc).Format("2006-01-02")
+	if store != nil {
+		if err := store.ResetStaleCycles(ctx, priorAttemptedDate); err != nil {
+			r.log(ctx, "warn", "reset stale milestone cycles failed", map[string]any{"reason": safeErrorMessage(err.Error())})
+			return
 		}
+	}
+	if latestTime, latestKey, hasLatest := CurrentOrLatestMilestone(now, cfg.Schedule, cfg.Location); hasLatest {
+		target, key = latestTime, latestKey
+		activeAttemptedKey = latestKey
+		priorAttemptedDate = latestTime.In(loc).Format("2006-01-02")
+		r.log(ctx, "info", "startup catch-up triggered", map[string]any{"milestone": latestKey})
 	}
 
 	for ctx.Err() == nil {
-		if retryTime, hasRetry := r.nextRetryTime(store, r.now(), target); hasRetry && r.now().Before(target) {
+		if retryTime, hasRetry := r.nextRetryTime(store, r.now(), nextTarget, activeAttemptedKey); hasRetry && r.now().Before(nextTarget) {
 			if !r.sleepUntil(ctx, retryTime) {
 				return
 			}
-			if !r.now().Before(target) {
+			if !r.now().Before(nextTarget) {
 				continue
 			}
-			_ = r.dispatchRetries(ctx)
-			continue
-		}
-		if !r.sleepUntil(ctx, target) {
-			return
-		}
-		if err := r.DispatchMilestone(ctx, key, target); err != nil {
-			if !sleepContext(ctx, cfg.RetryCooldown) {
-				return
+			retryCtx, cancelRetry := context.WithTimeoutCause(ctx, max(nextTarget.Sub(r.now()), 0), errors.New("retry superseded by next milestone"))
+			err := r.DispatchRetries(retryCtx)
+			cancelRetry()
+			if err != nil {
+				if !r.now().Before(nextTarget) {
+					target, key = nextTarget, nextKey
+					continue
+				}
+				if !sleepContext(ctx, cfg.RetryCooldown) {
+					return
+				}
 			}
 			continue
 		}
-		target, key = NextMilestone(target, cfg.Schedule, cfg.Location)
+
+		nowLocal := r.now().In(loc)
+		nextMidnight := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day()+1, 0, 0, 0, 0, loc)
+		wakeTarget := target
+		isMidnightWake := false
+		if nextMidnight.Before(target) {
+			wakeTarget = nextMidnight
+			isMidnightWake = true
+		}
+		if !r.sleepUntil(ctx, wakeTarget) {
+			return
+		}
+
+		nowAfterSleep := r.now()
+		currentDate := nowAfterSleep.In(loc).Format("2006-01-02")
+		if currentDate != priorAttemptedDate && store != nil {
+			if err := store.ResetCurrentCycles(ctx); err != nil {
+				r.log(ctx, "warn", "reset milestone cycles at date rollover failed", map[string]any{"reason": safeErrorMessage(err.Error())})
+				return
+			}
+			priorAttemptedDate = currentDate
+		}
+		if isMidnightWake && r.now().Before(target) {
+			continue
+		}
+		if latestTime, latestKey, hasLatest := CurrentOrLatestMilestone(nowAfterSleep, cfg.Schedule, cfg.Location); hasLatest && latestTime.After(target) {
+			target, key = latestTime, latestKey
+		}
+		activeAttemptedKey = key
+		priorAttemptedDate = target.In(loc).Format("2006-01-02")
+		successorTarget, successorKey := NextMilestone(target, cfg.Schedule, cfg.Location)
+		cycleDeadline := successorTarget
+		targetLocal := target.In(loc)
+		cycleMidnight := time.Date(targetLocal.Year(), targetLocal.Month(), targetLocal.Day()+1, 0, 0, 0, 0, loc)
+		if cycleMidnight.Before(cycleDeadline) {
+			cycleDeadline = cycleMidnight
+		}
+		milestoneCtx, cancelMilestone := context.WithTimeoutCause(ctx, max(cycleDeadline.Sub(r.now()), 0), errors.New("milestone cycle ended"))
+		err := r.DispatchMilestone(milestoneCtx, key, target)
+		cancelMilestone()
+		if err != nil {
+			nextTarget, nextKey = successorTarget, successorKey
+			if !r.now().Before(cycleDeadline) {
+				target, key = successorTarget, successorKey
+				continue
+			}
+			retryDue := r.now().Add(cfg.RetryCooldown)
+			if !retryDue.Before(cycleDeadline) {
+				target, key = successorTarget, successorKey
+				continue
+			}
+			if !r.sleepUntil(ctx, retryDue) {
+				return
+			}
+			if !r.now().Before(cycleDeadline) {
+				target, key = successorTarget, successorKey
+			}
+			continue
+		}
+		target, key = successorTarget, successorKey
+		nextTarget, nextKey = target, key
 	}
 }
 
@@ -225,27 +334,24 @@ func (r *Runtime) DispatchMilestone(ctx context.Context, milestoneKey string, mi
 			continue
 		}
 		state := store.Credential(credentialID)
-		credentialVersion := file.VersionKey()
-		if state.BlockedCredentialVersion != "" && state.BlockedCredentialVersion == credentialVersion {
-			r.updateStatus(ctx, store, credentialID, "blocked", "credential_unchanged_after_auth_failure", true)
-			r.log(ctx, "warn", "milestone credential blocked", map[string]any{"credential": credentialID, "milestone": milestoneKey, "reason": "credential_unchanged_after_auth_failure"})
-			continue
-		}
-		if state.BlockedCredentialVersion != "" {
-			_ = store.Update(ctx, credentialID, func(current *CredentialState) {
-				current.BlockedCredentialVersion = ""
-				current.LastError = ""
-			})
-		}
 		if state.LastProcessedMilestone == milestoneKey {
 			r.log(ctx, "info", "milestone credential already processed", map[string]any{"credential": credentialID, "milestone": milestoneKey})
 			continue
+		}
+		if state.AttemptedMilestone == milestoneKey {
+			// Same-cycle terminal failures and active cooldowns do not repeat. A stale in-flight
+			// marker means the prior worker exited before persisting an outcome, so retry it.
+			if state.Status != "in_flight" && (state.NextRetryAt.IsZero() || state.NextRetryAt.After(r.now())) {
+				continue
+			}
 		}
 		eligible = append(eligible, file)
 	}
 
 	if len(eligible) == 0 {
-		_ = store.SetLastMilestone(ctx, milestoneKey)
+		if err := store.SetLastMilestone(ctx, milestoneKey); err != nil {
+			return err
+		}
 		r.log(ctx, "warn", "auto-ping milestone evaluated with zero eligible credentials", map[string]any{
 			"milestone": milestoneKey, "eligible": 0, "total": len(files),
 		})
@@ -261,11 +367,14 @@ func (r *Runtime) DispatchMilestone(ctx context.Context, milestoneKey string, mi
 		workers = 1
 	}
 	jobs := make(chan AuthFile, len(eligible))
+	errs := make(chan error, len(eligible))
 	var workersWG sync.WaitGroup
 	for range workers {
 		workersWG.Go(func() {
 			for file := range jobs {
-				r.dispatchCredentialMilestone(ctx, cfg, store, file, milestoneKey, milestoneTime, false)
+				if err := r.dispatchCredentialMilestone(ctx, cfg, store, file, milestoneKey, milestoneTime, false); err != nil {
+					errs <- err
+				}
 			}
 		})
 	}
@@ -274,28 +383,39 @@ func (r *Runtime) DispatchMilestone(ctx context.Context, milestoneKey string, mi
 		case <-ctx.Done():
 			close(jobs)
 			workersWG.Wait()
-			return ctx.Err()
+			close(errs)
+			resultErr := ctx.Err()
+			for err := range errs {
+				resultErr = errors.Join(resultErr, err)
+			}
+			return resultErr
 		case jobs <- file:
 		}
 	}
 	close(jobs)
 	workersWG.Wait()
-
-	_ = store.SetLastMilestone(ctx, milestoneKey)
-	return nil
+	close(errs)
+	var resultErr error
+	for err := range errs {
+		resultErr = errors.Join(resultErr, err)
+	}
+	if err := store.SetLastMilestone(ctx, milestoneKey); err != nil {
+		resultErr = errors.Join(resultErr, err)
+	}
+	return resultErr
 }
 
-func (r *Runtime) nextRetryTime(store *StateStore, now, milestoneTarget time.Time) (time.Time, bool) {
-	if store == nil {
+func (r *Runtime) nextRetryTime(store *StateStore, now, milestoneTarget time.Time, milestoneKey string) (time.Time, bool) {
+	if store == nil || milestoneKey == "" {
 		return time.Time{}, false
 	}
 	var earliest time.Time
 	found := false
 	for _, account := range store.Accounts() {
-		if account.NextRetryAt.IsZero() || account.RetryCount < 1 || account.RetryCount >= 3 {
+		if account.NextRetryAt.IsZero() || account.RetryCount < 1 {
 			continue
 		}
-		if account.BlockedCredentialVersion != "" {
+		if account.AttemptedMilestone != milestoneKey {
 			continue
 		}
 		if !account.NextRetryAt.Before(milestoneTarget) {
@@ -353,24 +473,16 @@ func (r *Runtime) DispatchRetries(ctx context.Context) error {
 			continue
 		}
 		state := store.Credential(credentialID)
-		credentialVersion := file.VersionKey()
-		if state.BlockedCredentialVersion != "" && state.BlockedCredentialVersion == credentialVersion {
-			r.updateStatus(ctx, store, credentialID, "blocked", "credential_unchanged_after_auth_failure", true)
+		if state.LastProcessedMilestone == key {
 			continue
 		}
-		if state.BlockedCredentialVersion != "" {
-			_ = store.Update(ctx, credentialID, func(current *CredentialState) {
-				current.BlockedCredentialVersion = ""
-				current.LastError = ""
-			})
-		}
-		if state.LastProcessedMilestone == key {
+		if state.AttemptedMilestone != key {
 			continue
 		}
 		if state.NextRetryAt.IsZero() || state.NextRetryAt.After(now) {
 			continue
 		}
-		if state.RetryCount < 1 || state.RetryCount >= 3 {
+		if state.RetryCount < 1 {
 			continue
 		}
 		due = append(due, file)
@@ -385,11 +497,14 @@ func (r *Runtime) DispatchRetries(ctx context.Context) error {
 		workers = 1
 	}
 	jobs := make(chan AuthFile, len(due))
+	errs := make(chan error, len(due))
 	var workersWG sync.WaitGroup
 	for range workers {
 		workersWG.Go(func() {
 			for file := range jobs {
-				r.dispatchCredentialMilestone(ctx, cfg, store, file, key, target, true)
+				if err := r.dispatchCredentialMilestone(ctx, cfg, store, file, key, target, true); err != nil {
+					errs <- err
+				}
 			}
 		})
 	}
@@ -398,21 +513,31 @@ func (r *Runtime) DispatchRetries(ctx context.Context) error {
 		case <-ctx.Done():
 			close(jobs)
 			workersWG.Wait()
-			return ctx.Err()
+			close(errs)
+			resultErr := ctx.Err()
+			for err := range errs {
+				resultErr = errors.Join(resultErr, err)
+			}
+			return resultErr
 		case jobs <- file:
 		}
 	}
 	close(jobs)
 	workersWG.Wait()
-	return nil
+	close(errs)
+	var resultErr error
+	for err := range errs {
+		resultErr = errors.Join(resultErr, err)
+	}
+	return resultErr
 }
 
-func (r *Runtime) dispatchCredentialMilestone(ctx context.Context, cfg Config, store *StateStore, file AuthFile, milestoneKey string, milestoneTime time.Time, isRetry bool) {
+func (r *Runtime) dispatchCredentialMilestone(ctx context.Context, cfg Config, store *StateStore, file AuthFile, milestoneKey string, milestoneTime time.Time, isRetry bool) error {
 	credentialID := file.CredentialID()
 	done := make(chan struct{})
 	for {
 		if ctx.Err() != nil {
-			return
+			return ctx.Err()
 		}
 		active, loaded := r.inFlight.LoadOrStore(credentialID, done)
 		if !loaded {
@@ -420,7 +545,7 @@ func (r *Runtime) dispatchCredentialMilestone(ctx context.Context, cfg Config, s
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-active.(chan struct{}):
 		}
 	}
@@ -429,15 +554,14 @@ func (r *Runtime) dispatchCredentialMilestone(ctx context.Context, cfg Config, s
 		close(done)
 	}()
 	if store.Credential(credentialID).LastProcessedMilestone == milestoneKey {
-		return
+		return nil
 	}
 
-	credentialVersion := file.VersionKey()
-
 	attemptAt := r.now().UTC()
-	_ = store.Update(ctx, credentialID, func(current *CredentialState) {
+	if err := store.Update(ctx, credentialID, func(current *CredentialState) {
 		current.Status = "in_flight"
 		current.Reason = "milestone_triggered"
+		current.AttemptedMilestone = milestoneKey
 		current.LastAttemptAt = attemptAt
 		current.LastAttemptStatus = "in_flight"
 		current.Attempts++
@@ -445,11 +569,13 @@ func (r *Runtime) dispatchCredentialMilestone(ctx context.Context, cfg Config, s
 		if !isRetry {
 			current.RetryCount = 0
 		}
-	})
+	}); err != nil {
+		return fmt.Errorf("persist in-flight milestone state: %w", err)
+	}
 	r.log(ctx, "info", "Codex scheduled auto-ping started", map[string]any{"credential": credentialID, "milestone": milestoneKey, "is_retry": isRetry})
 
 	document, material, err := r.credentialMaterial(ctx, file)
-	result := ActivationResult{Failure: FailureTransport, Message: "credential material unavailable"}
+	result := ActivationResult{Failure: FailureRetryable, Message: "credential material unavailable"}
 	if err == nil {
 		if file.Name == "" {
 			file.Name = document.Name
@@ -458,9 +584,11 @@ func (r *Runtime) dispatchCredentialMilestone(ctx context.Context, cfg Config, s
 	}
 	completedAt := r.now().UTC()
 	if result.Success {
-		_ = store.Update(ctx, credentialID, func(current *CredentialState) {
+		if err := store.Update(ctx, credentialID, func(current *CredentialState) {
 			current.Status = "waiting"
 			current.Reason = "milestone_ping_succeeded"
+			current.AttemptedMilestone = milestoneKey
+			current.FailureKind = ""
 			current.LastProcessedMilestone = milestoneKey
 			current.LastProcessedMilestoneAt = milestoneTime.UTC()
 			current.LastPingAt = completedAt
@@ -468,47 +596,70 @@ func (r *Runtime) dispatchCredentialMilestone(ctx context.Context, cfg Config, s
 			current.LastError = ""
 			current.NextRetryAt = time.Time{}
 			current.RetryCount = 0
-			current.BlockedCredentialVersion = ""
 			current.SelectedModel = result.Model
 			current.Transport = result.Transport
 			current.Successes++
-		})
+		}); err != nil {
+			r.log(ctx, "warn", "persist milestone success state failed", map[string]any{"credential": credentialID, "milestone": milestoneKey, "error": safeErrorMessage(err.Error())})
+			return fmt.Errorf("persist milestone success state: %w", err)
+		}
 		r.log(ctx, "info", "Codex scheduled auto-ping succeeded", map[string]any{
 			"credential": credentialID, "milestone": milestoneKey, "model": result.Model, "transport": result.Transport,
 		})
-		return
+		return nil
 	}
 
-	_ = store.Update(ctx, credentialID, func(current *CredentialState) {
+	if err := store.Update(ctx, credentialID, func(current *CredentialState) {
 		current.Status = failureStatus(result.Failure)
 		if result.Failure == FailureAuth {
-			current.Reason = "credential_unchanged_after_auth_failure"
+			current.Reason = "credential_authentication_failed"
 		} else {
 			current.Reason = string(result.Failure)
 		}
+		current.AttemptedMilestone = milestoneKey
+		current.FailureKind = string(result.Failure)
 		current.LastAttemptStatus = "failed"
 		current.LastError = safeErrorMessage(result.Message)
 		current.SelectedModel = result.Model
 		current.Transport = result.Transport
 		current.Failures++
-		if result.Failure == FailureAuth {
-			current.BlockedCredentialVersion = credentialVersion
+
+		isRecoverable := result.Failure == FailureTransport || result.Failure == FailureTimeout || result.Failure == FailureRetryable
+		if !isRecoverable {
 			current.NextRetryAt = time.Time{}
-			current.RetryCount = 0
 		} else {
 			current.RetryCount++
-			if current.RetryCount < 3 {
-				current.NextRetryAt = completedAt.Add(cfg.RetryCooldown)
+			cooldown := cfg.RetryCooldown
+			if result.RetryAfter != nil && *result.RetryAfter > cooldown {
+				cooldown = *result.RetryAfter
+			}
+			retryTarget := completedAt.Add(cooldown)
+			nextMilestone, _ := NextMilestone(milestoneTime, cfg.Schedule, cfg.Location)
+			loc := cfg.Location
+			if loc == nil {
+				loc = time.Local
+			}
+			milestoneLocal := milestoneTime.In(loc)
+			midnight := time.Date(milestoneLocal.Year(), milestoneLocal.Month(), milestoneLocal.Day()+1, 0, 0, 0, 0, loc)
+			cycleEnd := nextMilestone
+			if midnight.Before(cycleEnd) {
+				cycleEnd = midnight
+			}
+			if retryTarget.Before(cycleEnd) {
+				current.NextRetryAt = retryTarget
 			} else {
 				current.NextRetryAt = time.Time{}
 			}
 		}
-	})
+	}); err != nil {
+		return fmt.Errorf("persist failed milestone state: %w", err)
+	}
 	fields := map[string]any{"credential": credentialID, "milestone": milestoneKey, "reason": result.Failure}
-	if result.Failure != FailureAuth {
-		fields["retry_at"] = completedAt.Add(cfg.RetryCooldown)
+	if state := store.Credential(credentialID); !state.NextRetryAt.IsZero() {
+		fields["retry_at"] = state.NextRetryAt
 	}
 	r.log(ctx, "warn", "Codex scheduled auto-ping failed", fields)
+	return nil
 }
 
 func (r *Runtime) snapshot() (Config, *StateStore, bool) {

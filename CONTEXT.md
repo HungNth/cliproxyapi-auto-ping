@@ -17,19 +17,31 @@ A configured daily wall-clock time (such as `05:00`) at which Auto-Ping triggers
 _Avoid_: Cron tick, timer trigger, reset boundary
 
 **Processed Milestone**:
-A Schedule Milestone on a given calendar day that has already been dispatched for a Codex Credential.
-_Avoid_: Processed reset, handled boundary
+A Schedule Milestone on a given calendar day whose Auto-Ping completed successfully and was recorded for a Codex Credential.
+_Avoid_: Dispatched milestone, processed reset, handled boundary
+
+**Milestone Attempt Cycle**:
+All Auto-Ping attempts for one Codex Credential and one Schedule Milestone, ending at whichever occurs first: success, the next Schedule Milestone, midnight in the configured timezone, or a schedule/timezone configuration change.
+_Avoid_: Retry queue, pending reset
 
 **Milestone Catch-Up**:
-An Auto-Ping dispatched upon plugin startup for any Eligible Credential that has not yet processed the most recent elapsed Schedule Milestone of the day, provided startup is at least one hour before the next milestone.
+An Auto-Ping dispatched upon plugin startup for any Eligible Credential that has not yet processed the most recent elapsed Schedule Milestone of the current calendar day in the configured schedule timezone.
 _Avoid_: Missed ping, replay, backfill
 
 **Auto-Ping**:
 A minimal real Codex inference request sent with one Codex Credential to start its next Five-Hour Window.
 _Avoid_: Quota increase, quota bypass, OAuth refresh
 
+**Milestone Retry**:
+A repeated Auto-Ping within the current Milestone Attempt Cycle after a Recoverable Auto-Ping Failure.
+_Avoid_: New milestone, catch-up ping
+
+**Recoverable Auto-Ping Failure**:
+An Auto-Ping failure that may succeed without credential or configuration changes, such as temporary credential access, network, timeout, rate-limit, stream, or upstream server failure.
+_Avoid_: Authentication failure, model/configuration error, business rejection
+
 **Eligible Credential**:
-A Codex Credential that is active, not explicitly excluded, and not blocked due to authentication failure.
+A Codex Credential that is not explicitly excluded and is neither disabled nor revoked. Temporary availability, retry, and prior authentication failure states do not remove eligibility at a later Schedule Milestone.
 _Avoid_: Every account, scheduler candidate
 
 **Plugin Manifest**:

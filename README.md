@@ -18,7 +18,7 @@ A successful request is recorded only after a valid Codex response stream comple
 
 While the plugin remains running, milestones reached during a slow batch or retry remain pending rather than being skipped. Requests may start later than the milestone when the worker pool is busy. A temporary credential-list failure keeps the milestone pending and retries discovery after `retry_cooldown`.
 
-On startup or reconfiguration, catch-up considers only today's most recent elapsed milestone. It dispatches unprocessed eligible credentials only when the next milestone is at least one hour away. Before today's first milestone, or less than one hour before the next one, it waits instead. Reconfiguration cancels the old timer and queued work before the replacement loop dispatches under the new settings; an already-running request may still need time to terminate.
+On startup, enablement, or reconfiguration, catch-up considers only today's most recent elapsed milestone in the configured schedule timezone and dispatches unprocessed eligible credentials immediately. Before today's first milestone, it waits instead. Reconfiguration cancels the old timer and queued work, waits for any in-flight scanner execution to exit, and then activates the replacement schedule without scheduler overlap.
 
 The plugins are independent and may be enabled together. This plugin does not modify `quota-activation` behavior or state.
 
@@ -44,7 +44,7 @@ plugins:
                 - "15:00"
                 - "20:00"
             timezone: "Local"
-            retry_cooldown: "2m"
+            retry_cooldown: "1m"
             max_concurrency: 1
             request_timeout: "60s"
 
@@ -80,7 +80,7 @@ An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the p
 | `auto_ping_disabled`       | `false`                            | Set to `true` to opt out of background inference requests  |
 | `schedule`                 | `["05:00", "10:00", "15:00", "20:00"]` | Daily auto-ping milestone times in 24-hour format      |
 | `timezone`                 | `Local`                            | Timezone for daily schedule milestones                     |
-| `retry_cooldown`           | `2m`                               | Delay before retrying after an activation failure          |
+| `retry_cooldown`           | `1m`                               | Delay before retrying after an activation failure          |
 | `max_concurrency`          | `1`                                | Maximum credentials processed concurrently                 |
 | `request_timeout`          | `60s`                              | Inference operation timeout                               |
 | `prompt`                   | `ping`                             | Minimal user input                                         |
@@ -89,17 +89,18 @@ An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the p
 | `scheduler_boost_fallback` | `true`                             | Fallback only for host/transport failures                  |
 | `state_path`               | `cliproxyapi-auto-ping/state.json` | Persistent state location                                  |
 
+> **Upgrade notice (State Schema v2):** This release performs an intentionally destructive state schema cutover. Existing version 1 state files are rejected on startup and configuration. Operators upgrading from an earlier version must remove the existing `state.json` file or point `state_path` to a new location before enabling this release.
 ## Eligibility and failure handling
 
-The scheduler skips disabled, revoked, explicitly excluded, non-Codex, and unchanged authentication-blocked credentials. The host's temporary `unavailable` flag alone does not exclude a credential. A successful milestone is deduplicated per credential, not by the global milestone marker.
+The scheduler skips disabled, revoked, explicitly excluded, and non-Codex credentials. The host's temporary `unavailable` flag alone does not exclude a credential, and prior authentication failure does not suppress a subsequent milestone. A successful milestone is deduplicated per credential, not by the global milestone marker.
 
-- Credential material read failure, network/stream failure, or temporary upstream failure: retry after `retry_cooldown`, up to three total attempts per credential in the milestone cycle. The next milestone starts a new cycle.
-- Invalid authentication: block retries until CLIProxyAPI reports that the credential changed or refreshed.
+- Credential material read failure, network/stream failure, rate limit (HTTP 429), or temporary upstream failure: retry after the later of `retry_cooldown` and upstream `Retry-After` without a fixed attempt cap until success, the next milestone, midnight in the configured schedule timezone, or reconfiguration.
+- Invalid authentication, model failure, or business rejection: terminal for the current cycle with no minute retries, but a fresh attempt cycle begins at the next scheduled milestone.
 - Unsupported auto-selected model: try the next configured candidate once.
 - Explicit model failure: do not silently change models.
 - Direct business/authentication errors: never invoke scheduler fallback.
 
-Being scheduled guarantees an attempt under these eligibility rules, not upstream success. Exhausted retries or unchanged invalid authentication can leave a credential without a successful ping.
+Being scheduled guarantees an attempt under these eligibility rules, not upstream success. An active cycle continues retrying recoverable errors until its cycle boundary (the next milestone, configured-timezone midnight, or reconfiguration), while terminal failures (such as authentication or business rejections) wait for the next scheduled milestone to start fresh.
 
 `scheduler_boost_fallback` temporarily raises the target credential's priority, adds a one-time nonce, and accepts success only if the plugin scheduler confirms that CLIProxyAPI selected the intended credential. The original priority is restored from the latest credential document so a concurrent token refresh is not overwritten.
 

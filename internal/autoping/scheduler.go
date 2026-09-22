@@ -135,9 +135,14 @@ func (r *Runtime) schedulerActivate(ctx context.Context, cfg Config, file AuthFi
 		return ActivationResult{Model: model, Transport: TransportSchedulerBoost, Failure: failure, Message: "scheduler model execution failed"}
 	}
 	success, failure, message := evaluateCodexResponse(response.StatusCode, response.Body)
+	var retryAfter *time.Duration
+	if response.Headers != nil {
+		retryAfter = parseRetryAfter(response.Headers.Get("Retry-After"), r.now())
+	}
 	return ActivationResult{
 		Success: success, Model: model, Transport: TransportSchedulerBoost,
 		StatusCode: response.StatusCode, Failure: failure, Message: message,
+		RetryAfter: retryAfter,
 	}
 }
 

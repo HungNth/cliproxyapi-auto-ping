@@ -1,6 +1,7 @@
 package autoping
 
 import (
+	"encoding/json"
 	"errors"
 	"slices"
 	"testing"
@@ -15,6 +16,9 @@ func TestConfigDefaultsEnableAutoPing(t *testing.T) {
 	}
 	if !slices.Equal(cfg.Schedule, []string{"05:00", "10:00", "15:00", "20:00"}) || cfg.Timezone != "Local" || cfg.Model != "auto" {
 		t.Fatalf("unexpected defaults: %#v", cfg)
+	}
+	if cfg.RetryCooldown != time.Minute {
+		t.Fatalf("retry_cooldown default = %v, want 1m", cfg.RetryCooldown)
 	}
 	if got := cfg.Models(); len(got) != 2 || got[0] != "gpt-5.5" || got[1] != "gpt-5.6-luna" {
 		t.Fatalf("model candidates = %#v", got)
@@ -119,4 +123,56 @@ func TestConfigParsesCaseInsensitiveTimezonesAndEmbeddedTzdata(t *testing.T) {
 		}
 	}
 }
+func TestConfigRejectsObsoleteAndUnknownFields(t *testing.T) {
+	runtime := newTestRuntime(t, newFakeHost(), Options{})
+	invalidConfigs := []string{
+		"scan_interval: 1m\n",
+		"activation_delay: 10s\n",
+		"unexpected_key: true\n",
+		"schedule:\n  - \"05:00\"\nunknown_option: 42\n",
+		"schedule:\n  - \"05:00\"\n---\nschedule:\n  - \"10:00\"\n",
+		"schedule:\n  - \"05:00\"\n---\nunknown_trailing: true\n",
+	}
+	for _, item := range invalidConfigs {
+		_, err := runtime.parseConfig([]byte(item))
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("parseConfig(%q) expected ErrInvalidConfig, got %v", item, err)
+		}
+	}
+}
 
+func TestLifecycleRejectsObsoleteAndUnknownConfigKeys(t *testing.T) {
+	cases := []struct {
+		method string
+		yaml   string
+	}{
+		{method: "plugin.register", yaml: "scan_interval: 1m\n"},
+		{method: "plugin.reconfigure", yaml: "activation_delay: 10s\n"},
+		{method: "plugin.reconfigure", yaml: "unexpected_key: true\n"},
+		{method: "plugin.reconfigure", yaml: "schedule:\n  - \"05:00\"\n---\nunknown_trailing: true\n"},
+		{method: "plugin.reconfigure", yaml: "schedule:\n  - \"05:00\"\n---\n: malformed\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method+"/"+tc.yaml, func(t *testing.T) {
+			runtime := newTestRuntime(t, newFakeHost(), Options{})
+			req, err := json.Marshal(map[string]string{"config_yaml": tc.yaml})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp := runtime.Handle(t.Context(), tc.method, req)
+			var envelope struct {
+				OK    bool `json:"ok"`
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(resp, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.OK || envelope.Error.Code != "invalid_config" {
+				t.Fatalf("%s response = %s, want invalid_config error", tc.method, string(resp))
+			}
+		})
+	}
+}

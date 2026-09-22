@@ -1,9 +1,12 @@
 package autoping
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -130,13 +133,100 @@ func TestScheduleLoopPreservesMilestonesWhileBusy(t *testing.T) {
 				synctest.Wait()
 				for _, id := range []string{"codex-a", "codex-b"} {
 					state := runtime.store.Credential(id)
-					if state.LastProcessedMilestone != "2000-01-01#00:02" || state.Successes != 2 {
-						t.Errorf("%s: processed %q, successes=%d; want both 00:01 and 00:02 milestones", id, state.LastProcessedMilestone, state.Successes)
+					expectedSuccess := 2
+					if retry && id == "codex-a" {
+						// codex-a failed at 00:01 and its retry was canceled when 00:02 arrived, then succeeded at 00:02.
+						expectedSuccess = 1
+					}
+					if !retry && id == "codex-b" {
+						// The serialized 00:01 batch reached codex-b across the 00:02 boundary, so only its fresh 00:02 attempt succeeds.
+						expectedSuccess = 1
+					}
+					if state.LastProcessedMilestone != "2000-01-01#00:02" || state.Successes != uint64(expectedSuccess) {
+						t.Errorf("%s: processed %q, successes=%d; want milestone 00:02, successes=%d", id, state.LastProcessedMilestone, state.Successes, expectedSuccess)
 					}
 				}
 			})
 		})
 	}
+}
+
+func TestScheduleLoopCancelsRegularRequestAtNextMilestone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.docs[file.AuthIndex] = document
+
+		var requests atomic.Int32
+		host.httpStreamContextFunc = func(ctx context.Context, _ HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			if requests.Add(1) == 1 {
+				<-ctx.Done()
+				return HTTPStreamResponse{}, nil, context.Cause(ctx)
+			}
+			return successStream()
+		}
+
+		runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+		cfg := testConfig(t, runtime, "schedule: [\"00:01\", \"00:02\", \"05:00\"]\ntimezone: UTC\nrequest_timeout: 10m\n")
+		cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+		if err := runtime.Configure(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Shutdown(t.Context())
+
+		time.Sleep(2 * time.Minute)
+		synctest.Wait()
+
+		if requests.Load() != 2 {
+			t.Fatalf("requests = %d, want canceled 00:01 plus fresh 00:02", requests.Load())
+		}
+		state := runtime.store.Credential(file.ID)
+		if state.LastProcessedMilestone != "2000-01-01#00:02" {
+			t.Fatalf("processed milestone = %q, want 2000-01-01#00:02", state.LastProcessedMilestone)
+		}
+	})
+}
+
+func TestScheduleLoopDispatchesNewMilestoneWithoutCooldownAfterRetryDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.docs[file.AuthIndex] = document
+
+		var requests atomic.Int32
+		host.httpStreamContextFunc = func(ctx context.Context, _ HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			switch requests.Add(1) {
+			case 1:
+				return HTTPStreamResponse{StatusCode: http.StatusInternalServerError}, []HTTPStreamChunk{{Done: true}}, nil
+			case 2:
+				<-ctx.Done()
+				return HTTPStreamResponse{}, nil, context.Cause(ctx)
+			default:
+				return successStream()
+			}
+		}
+
+		runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+		cfg := testConfig(t, runtime, "schedule: [\"00:01\", \"00:02\", \"05:00\"]\ntimezone: UTC\nretry_cooldown: 30s\nrequest_timeout: 10m\n")
+		cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+		if err := runtime.Configure(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Shutdown(t.Context())
+
+		time.Sleep(2 * time.Minute)
+		synctest.Wait()
+
+		if requests.Load() != 3 {
+			t.Fatalf("requests = %d, want initial failure, canceled retry, and immediate 00:02 attempt", requests.Load())
+		}
+		state := runtime.store.Credential(file.ID)
+		if state.LastProcessedMilestone != "2000-01-01#00:02" {
+			t.Fatalf("processed milestone = %q, want 2000-01-01#00:02", state.LastProcessedMilestone)
+		}
+	})
 }
 
 func TestScheduleLoopRetriesUnavailableCredentialMaterial(t *testing.T) {
@@ -163,6 +253,7 @@ func TestScheduleLoopRetriesUnavailableCredentialMaterial(t *testing.T) {
 		host.mu.Unlock()
 		time.Sleep(time.Minute)
 		synctest.Wait()
+
 		state := runtime.store.Credential(file.ID)
 		if state.LastProcessedMilestone != "2000-01-01#00:01" || state.Successes != 1 {
 			t.Fatalf("recovered credential was not pinged: milestone=%q, successes=%d, reason=%s", state.LastProcessedMilestone, state.Successes, state.Reason)
@@ -263,7 +354,7 @@ func TestScheduleLoopReconfigurationCancelsOldTimer(t *testing.T) {
 		}
 		time.Sleep(time.Minute)
 		synctest.Wait()
-		if state := runtime.store.Credential(file.ID); state.LastProcessedMilestone != "2000-01-01#07:04" || state.Successes != 2 {
+		if state := runtime.store.Credential(file.ID); state.LastProcessedMilestone != "2000-01-01#07:04" || state.Successes != 3 {
 			t.Fatalf("re-enabled schedule did not resume: processed=%q, successes=%d", state.LastProcessedMilestone, state.Successes)
 		}
 	})
@@ -346,7 +437,163 @@ func TestScheduleLoopReconfigurationCancelsQueuedCredentials(t *testing.T) {
 		})
 	}
 }
+func TestScheduleLoopReconfigurationWaitsForInFlightDispatchAndEvaluatesDueMilestone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.docs[file.AuthIndex] = document
 
+		inFlightStarted := make(chan struct{}, 1)
+		unblockInFlight := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-unblockInFlight:
+			default:
+				close(unblockInFlight)
+			}
+		})
+
+		host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			select {
+			case inFlightStarted <- struct{}{}:
+			default:
+			}
+			<-unblockInFlight
+			return successStream()
+		}
+
+		runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+		cfg := testConfig(t, runtime, "schedule: [\"00:01\", \"05:00\"]\ntimezone: UTC\n")
+		cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+		if err := runtime.Configure(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Shutdown(t.Context())
+
+		// Advance to 00:01 to trigger first dispatch
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		<-inFlightStarted
+
+		// While first dispatch is held in-flight, reconfigure to 00:02
+		updated := testConfig(t, runtime, "schedule: [\"00:02\", \"05:00\"]\ntimezone: UTC\n")
+		updated.StatePath = cfg.StatePath
+
+		reconfigureDone := make(chan error, 1)
+		go func() {
+			reconfigureDone <- runtime.Configure(t.Context(), updated)
+		}()
+
+		// Give Configure a bounded scheduling window; it must still be blocked on the in-flight scanner.
+		time.Sleep(10 * time.Second)
+		select {
+		case err := <-reconfigureDone:
+			t.Fatalf("reconfiguration completed before in-flight drain: %v", err)
+		default:
+		}
+
+		// Now unblock the old in-flight stream so it can finish/exit
+		close(unblockInFlight)
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+
+		if err := <-reconfigureDone; err != nil {
+			t.Fatalf("reconfigure failed: %v", err)
+		}
+
+		// Advance clock past 00:02; the new replacement scheduler must fire for 00:02
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		state := runtime.store.Credential(file.ID)
+		if state.LastProcessedMilestone != "2000-01-01#00:02" {
+			t.Fatalf("replacement scheduler missed due milestone: got %q, want 2000-01-01#00:02", state.LastProcessedMilestone)
+		}
+	})
+}
+func TestConcurrentConfigureSerializedCleanly(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.docs[file.AuthIndex] = document
+
+		firstFired := make(chan struct{}, 1)
+		unblockFirstStream := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-unblockFirstStream:
+			default:
+				close(unblockFirstStream)
+			}
+		})
+		host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			select {
+			case firstFired <- struct{}{}:
+				<-unblockFirstStream
+			default:
+			}
+			return successStream()
+		}
+
+		runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+		cfg := testConfig(t, runtime, "schedule: [\"00:01\", \"05:00\"]\ntimezone: UTC\n")
+		cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+		if err := runtime.Configure(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Shutdown(t.Context())
+
+		// Advance to trigger first scheduleLoop at 00:01
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		<-firstFired
+
+		cfgB := testConfig(t, runtime, "schedule: [\"00:03\", \"05:00\"]\ntimezone: UTC\n")
+		cfgB.StatePath = cfg.StatePath
+
+		cfgC := testConfig(t, runtime, "schedule: [\"00:04\", \"05:00\"]\ntimezone: UTC\n")
+		cfgC.StatePath = cfg.StatePath
+
+		errB := make(chan error, 1)
+		errC := make(chan error, 1)
+
+		go func() { errB <- runtime.Configure(t.Context(), cfgB) }()
+		time.Sleep(10 * time.Millisecond)
+		select {
+		case err := <-errB:
+			t.Fatalf("Configure B completed before old scanner drained: %v", err)
+		default:
+		}
+
+		go func() { errC <- runtime.Configure(t.Context(), cfgC) }()
+		// B owns configMu and is blocked draining the old scanner; C queues behind B.
+		close(unblockFirstStream)
+		synctest.Wait()
+		if err := <-errB; err != nil {
+			t.Fatalf("Configure B failed: %v", err)
+		}
+		if err := <-errC; err != nil {
+			t.Fatalf("Configure C failed: %v", err)
+		}
+		request, _ := json.Marshal(managementRequest{Method: http.MethodGet, Path: "/v0/management/cliproxyapi-auto-ping/status"})
+		raw := runtime.Handle(t.Context(), "management.handle", request)
+		response := decodeManagementResponse(t, raw)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", response.StatusCode)
+		}
+		var payload struct {
+			Schedule []string `json:"schedule"`
+		}
+		if err := json.Unmarshal(response.Body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload.Schedule) != 2 || payload.Schedule[0] != "00:04" {
+			t.Fatalf("final schedule after concurrent reconfigurations = %v, want 00:04", payload.Schedule)
+		}
+	})
+}
 func TestScheduledMilestoneSkipsExcludedAndIneligibleCredentials(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 9, 18, 5, 0, 0, 0, time.UTC)}
 	host := newFakeHost()
@@ -421,6 +668,125 @@ func TestScheduledMilestonePingsUnavailableCredential(t *testing.T) {
 		t.Fatalf("unavailable credential state = %#v", state)
 	}
 }
+func TestConsecutiveMilestonesFreshAttemptAcrossFailureAndSuccessOutcomes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clock := &fakeClock{now: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)}
+		host := newFakeHost()
+		// 4 credentials:
+		// 1. codex-succ: succeeds at 00:01, must run again at 00:02
+		// 2. codex-unavail: unavailable flag true, must run at both
+		// 3. codex-auth: returns 401 at 00:01, must attempt again at 00:02
+		// 4. codex-cool: returns 500 at 00:01 (entering cooldown), must attempt afresh at 00:02
+		// 5. codex-excluded: in exclude_credentials, never attempted
+		succ, docSucc := credential("codex-succ", "token-succ", 1)
+		unavail, docUnavail := credential("codex-unavail", "token-unavail", 1)
+		unavail.Unavailable = true
+		authFail, docAuth := credential("codex-auth", "token-auth", 1)
+		cool, docCool := credential("codex-cool", "token-cool", 1)
+		excl, docExcl := credential("codex-excluded", "token-excl", 1)
+
+		host.auths = []AuthFile{succ, unavail, authFail, cool, excl}
+		host.docs[succ.AuthIndex] = docSucc
+		host.docs[unavail.AuthIndex] = docUnavail
+		host.docs[authFail.AuthIndex] = docAuth
+		host.docs[cool.AuthIndex] = docCool
+		host.docs[excl.AuthIndex] = docExcl
+
+		var cycle atomic.Int32
+		cycle.Store(1)
+		host.httpStreamFunc = func(req HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			acct := req.Headers.Get("ChatGPT-Account-ID")
+			if cycle.Load() == 1 {
+				switch acct {
+				case "account-codex-auth":
+					return HTTPStreamResponse{StatusCode: http.StatusUnauthorized}, []HTTPStreamChunk{{Done: true}}, nil
+				case "account-codex-cool":
+					return HTTPStreamResponse{StatusCode: http.StatusInternalServerError}, []HTTPStreamChunk{{Done: true}}, nil
+				default:
+					return successStream()
+				}
+			}
+			// In cycle 2 (00:02), all eligible succeed
+			return successStream()
+		}
+		runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: new(time.Duration)})
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		cfgYAML := "schedule:\n  - \"00:01\"\n  - \"00:02\"\n  - \"05:00\"\ntimezone: UTC\nretry_cooldown: 5m\nmax_concurrency: 4\nexclude_credentials:\n  - codex-excluded\nstate_path: " + statePath + "\n"
+		reconfReq, _ := json.Marshal(map[string]string{"config_yaml": cfgYAML})
+		reconfResp := runtime.Handle(t.Context(), "plugin.reconfigure", reconfReq)
+		var envelope struct {
+			OK bool `json:"ok"`
+		}
+		if err := json.Unmarshal(reconfResp, &envelope); err != nil || !envelope.OK {
+			t.Fatalf("reconfigure failed: %s", string(reconfResp))
+		}
+		defer runtime.Shutdown(t.Context())
+
+		// Advance time to 00:01 (milestone 1)
+		clock.Advance(time.Minute)
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		// 4 requests made (succ, unavail, auth, cool); excl skipped
+		if host.streamRequestCount() != 4 {
+			t.Fatalf("cycle 1 requests = %d, want 4", host.streamRequestCount())
+		}
+
+		// Verify cycle 1 states via management status route
+		statusReq, _ := json.Marshal(managementRequest{Method: "GET", Path: "/v0/management/cliproxyapi-auto-ping/status"})
+		rawStatus := runtime.Handle(t.Context(), "management.handle", statusReq)
+		decoded := decodeManagementResponse(t, rawStatus)
+		var payload struct {
+			Accounts []struct {
+				CredentialID           string `json:"credential_id"`
+				Status                 string `json:"status"`
+				LastProcessedMilestone string `json:"last_processed_milestone"`
+				AttemptedMilestone     string `json:"attempted_milestone"`
+			} `json:"accounts"`
+		}
+		if err := json.Unmarshal(decoded.Body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		for _, acct := range payload.Accounts {
+			switch acct.CredentialID {
+			case "codex-succ", "codex-unavail":
+				if acct.LastProcessedMilestone != "2000-01-01#00:01" || acct.Status != "waiting" {
+					t.Fatalf("%s cycle 1 state = %#v", acct.CredentialID, acct)
+				}
+			case "codex-auth":
+				if acct.LastProcessedMilestone != "" || acct.Status != "blocked" {
+					t.Fatalf("codex-auth cycle 1 state = %#v", acct)
+				}
+			case "codex-cool":
+				if acct.LastProcessedMilestone != "" || acct.Status != "cooldown" {
+					t.Fatalf("codex-cool cycle 1 state = %#v", acct)
+				}
+			}
+		}
+		// Switch to cycle 2 and advance to 00:02.
+		cycle.Store(2)
+		clock.Advance(time.Minute)
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		// In cycle 2: ALL 4 credentials receive fresh attempts and succeed (+4 requests = 8 total)
+		if host.streamRequestCount() != 8 {
+			t.Fatalf("cycle 2 total requests = %d, want 8 (all 4 fresh attempts ran)", host.streamRequestCount())
+		}
+
+		rawStatus = runtime.Handle(t.Context(), "management.handle", statusReq)
+		decoded = decodeManagementResponse(t, rawStatus)
+		_ = json.Unmarshal(decoded.Body, &payload)
+		for _, acct := range payload.Accounts {
+			switch acct.CredentialID {
+			case "codex-succ", "codex-unavail", "codex-auth", "codex-cool":
+				if acct.LastProcessedMilestone != "2000-01-01#00:02" || acct.Status != "waiting" {
+					t.Fatalf("%s cycle 2 state = %#v, want 2000-01-01#00:02 and waiting", acct.CredentialID, acct)
+				}
+			}
+		}
+	})
+}
 
 func TestStartupCatchUpRunsWhenMoreThanOneHourBeforeNextMilestone(t *testing.T) {
 	// 07:30 UTC is after 05:00 milestone, and 10:00 milestone is 2.5 hours away (>= 1 hour)
@@ -454,8 +820,8 @@ func TestStartupCatchUpRunsWhenMoreThanOneHourBeforeNextMilestone(t *testing.T) 
 	}
 }
 
-func TestStartupCatchUpSkippedWhenLessThanOneHourBeforeNextMilestone(t *testing.T) {
-	// 09:15 UTC is 45 minutes before the 10:00 milestone (< 1 hour)
+func TestStartupCatchUpRunsWhenLessThanOneHourBeforeNextMilestone(t *testing.T) {
+	// 09:15 UTC is 45 minutes before the 10:00 milestone; with 1h threshold removed, catch-up must run!
 	clock := &fakeClock{now: time.Date(2026, 9, 18, 9, 15, 0, 0, time.UTC)}
 	host := newFakeHost()
 	file, document := credential("codex-a", "token-a", 1)
@@ -476,9 +842,97 @@ func TestStartupCatchUpSkippedWhenLessThanOneHourBeforeNextMilestone(t *testing.
 
 	time.Sleep(50 * time.Millisecond)
 
-	if host.streamRequestCount() != 0 {
-		t.Fatalf("catch-up pings = %d, want 0 (skipped due to < 1h threshold)", host.streamRequestCount())
+	if host.streamRequestCount() != 1 {
+		t.Fatalf("catch-up pings = %d, want 1 (catch-up must run even when < 1h before next milestone)", host.streamRequestCount())
 	}
+	state := runtime.store.Credential("codex-a")
+	if state.LastProcessedMilestone != "2026-09-18#05:00" {
+		t.Fatalf("catch-up milestone = %q, want 2026-09-18#05:00", state.LastProcessedMilestone)
+	}
+}
+func TestStartupCatchUpAt0959AndCoalescesMissedMilestones(t *testing.T) {
+	// 1. Startup at 09:59 with schedule 05:00, 10:00:
+	// Both 05:00 was missed earlier today. Catch-up must run for 05:00 immediately.
+	clock := &fakeClock{now: time.Date(2026, 9, 18, 9, 59, 0, 0, time.UTC)}
+	host := newFakeHost()
+	file, document := credential("codex-a", "token-a", 1)
+	host.auths = []AuthFile{file}
+	host.docs[file.AuthIndex] = document
+	host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+		return successStream()
+	}
+
+	startupDelay := time.Millisecond
+	runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
+	cfg := testConfig(t, runtime, "schedule:\n  - \"05:00\"\n  - \"08:00\"\n  - \"10:00\"\ntimezone: UTC\n")
+	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+	if err := runtime.Configure(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Shutdown(t.Context())
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Multiple missed milestones (05:00 and 08:00) coalesce to the latest elapsed milestone (08:00)
+	if host.streamRequestCount() != 1 {
+		t.Fatalf("catch-up pings = %d, want 1 (coalesced to latest elapsed milestone)", host.streamRequestCount())
+	}
+	state := runtime.store.Credential("codex-a")
+	if state.LastProcessedMilestone != "2026-09-18#08:00" {
+		t.Fatalf("coalesced milestone = %q, want 2026-09-18#08:00", state.LastProcessedMilestone)
+	}
+}
+
+func TestScheduleLoopWakeUpCoalescesToLatestElapsedMilestone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clock := &fakeClock{now: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)}
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.docs[file.AuthIndex] = document
+		host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			return successStream()
+		}
+
+		runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: new(time.Duration)})
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		cfgYAML := "schedule: [\"00:01\", \"00:02\", \"00:03\", \"05:00\"]\ntimezone: UTC\nstate_path: " + statePath + "\n"
+		req, err := json.Marshal(map[string]string{"config_yaml": cfgYAML})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := runtime.Handle(t.Context(), "plugin.reconfigure", req)
+		var envelope struct {
+			OK bool `json:"ok"`
+		}
+		if err := json.Unmarshal(resp, &envelope); err != nil || !envelope.OK {
+			t.Fatalf("reconfigure failed: %s", string(resp))
+		}
+		defer runtime.Shutdown(t.Context())
+
+		// Simulate suspension until 00:03:10. The loop must coalesce 00:01/00:02/00:03 to 00:03.
+		clock.Advance(3*time.Minute + 10*time.Second)
+		time.Sleep(3*time.Minute + 10*time.Second)
+		synctest.Wait()
+
+		if host.streamRequestCount() != 1 {
+			t.Fatalf("wake-up requests = %d, want 1 latest milestone", host.streamRequestCount())
+		}
+		statusReq, _ := json.Marshal(managementRequest{Method: http.MethodGet, Path: "/v0/management/cliproxyapi-auto-ping/status"})
+		statusRaw := runtime.Handle(t.Context(), "management.handle", statusReq)
+		statusResp := decodeManagementResponse(t, statusRaw)
+		var payload struct {
+			Accounts []struct {
+				LastProcessedMilestone string `json:"last_processed_milestone"`
+			} `json:"accounts"`
+		}
+		if err := json.Unmarshal(statusResp.Body, &payload); err != nil || len(payload.Accounts) != 1 {
+			t.Fatalf("status decode failed: %v", err)
+		}
+		if payload.Accounts[0].LastProcessedMilestone != "2000-01-01#00:03" {
+			t.Fatalf("wake-up milestone = %q, want 2000-01-01#00:03", payload.Accounts[0].LastProcessedMilestone)
+		}
+	})
 }
 
 func TestStartupCatchUpSkippedIfAlreadyProcessed(t *testing.T) {
@@ -637,21 +1091,29 @@ func TestDisabledAutoPingSendsNoRequests(t *testing.T) {
 	}
 }
 
-func TestMilestoneRetryTransientFailureAndMaxAttempts(t *testing.T) {
+func TestMilestoneRetryTransientFailureBeyondThreeAttemptsAndRetryAfter(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 9, 18, 5, 0, 0, 0, time.UTC)}
 	host := newFakeHost()
 	file, document := credential("codex-a", "token-a", 1)
 	host.auths = []AuthFile{file}
 	host.docs[file.AuthIndex] = document
 
-	// Simulate 500 internal server error (transient failure)
+	retryAfterHeader := ""
+	returnStatusCode := http.StatusInternalServerError
 	host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
-		return HTTPStreamResponse{StatusCode: http.StatusInternalServerError}, []HTTPStreamChunk{{Payload: []byte(`{"error":"server error"}`), Done: true}}, nil
+		headers := http.Header{}
+		if retryAfterHeader != "" {
+			headers.Set("Retry-After", retryAfterHeader)
+		}
+		return HTTPStreamResponse{
+			StatusCode: returnStatusCode,
+			Headers:    headers,
+		}, []HTTPStreamChunk{{Payload: []byte(`{"error":"upstream error"}`), Done: true}}, nil
 	}
 
 	startupDelay := 24 * time.Hour
 	runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
-	cfg := testConfig(t, runtime, "retry_cooldown: 2m\ntimezone: UTC\n")
+	cfg := testConfig(t, runtime, "schedule:\n  - \"05:00\"\n  - \"10:00\"\nretry_cooldown: 1m\ntimezone: UTC\n")
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	if err := runtime.Configure(t.Context(), cfg); err != nil {
 		t.Fatal(err)
@@ -660,8 +1122,6 @@ func TestMilestoneRetryTransientFailureAndMaxAttempts(t *testing.T) {
 
 	milestoneKey := "2026-09-18#05:00"
 	milestoneTime := clock.Now()
-	nextMilestoneTarget := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
-
 	// Attempt 1: Milestone dispatch fails
 	if err := runtime.DispatchMilestone(t.Context(), milestoneKey, milestoneTime); err != nil {
 		t.Fatal(err)
@@ -670,81 +1130,41 @@ func TestMilestoneRetryTransientFailureAndMaxAttempts(t *testing.T) {
 	if state.Attempts != 1 || state.Failures != 1 || state.RetryCount != 1 {
 		t.Fatalf("attempt 1 state: attempts=%d, failures=%d, retry_count=%d", state.Attempts, state.Failures, state.RetryCount)
 	}
-	if state.Status != "cooldown" {
-		t.Fatalf("attempt 1 status = %q, want cooldown", state.Status)
-	}
-	expectedRetry1 := clock.Now().Add(2 * time.Minute)
+	expectedRetry1 := clock.Now().Add(time.Minute)
 	if !state.NextRetryAt.Equal(expectedRetry1) {
 		t.Fatalf("next_retry_at = %v, want %v", state.NextRetryAt, expectedRetry1)
 	}
 
-	retryTime, hasRetry := runtime.nextRetryTime(runtime.store, clock.Now(), nextMilestoneTarget)
-	if !hasRetry || !retryTime.Equal(expectedRetry1) {
-		t.Fatalf("nextRetryTime = (%v, %v), want (%v, true)", retryTime, hasRetry, expectedRetry1)
+	// Attempt 2, 3, 4, 5: Verify no attempt cap at 3
+	for attempt := 2; attempt <= 5; attempt++ {
+		clock.Advance(time.Minute)
+		if err := runtime.DispatchRetries(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		state = runtime.store.Credential("codex-a")
+		if state.Attempts != uint64(attempt) || state.Failures != uint64(attempt) || state.RetryCount != attempt {
+			t.Fatalf("attempt %d state: attempts=%d, failures=%d, retry_count=%d", attempt, state.Attempts, state.Failures, state.RetryCount)
+		}
+		expectedRetry := clock.Now().Add(time.Minute)
+		if !state.NextRetryAt.Equal(expectedRetry) {
+			t.Fatalf("attempt %d next_retry_at = %v, want %v", attempt, state.NextRetryAt, expectedRetry)
+		}
 	}
 
-	// Advance clock to first retry time (05:02)
-	clock.Advance(2 * time.Minute)
-
-	// Attempt 2: Retry 1 fails
+	// Attempt 6: Upstream returns HTTP 429 with Retry-After: 120 (2 minutes)
+	returnStatusCode = http.StatusTooManyRequests
+	retryAfterHeader = "120"
+	clock.Advance(time.Minute)
 	if err := runtime.DispatchRetries(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	state = runtime.store.Credential("codex-a")
-	if state.Attempts != 2 || state.Failures != 2 || state.RetryCount != 2 {
-		t.Fatalf("attempt 2 state: attempts=%d, failures=%d, retry_count=%d", state.Attempts, state.Failures, state.RetryCount)
-	}
-	expectedRetry2 := clock.Now().Add(2 * time.Minute)
-	if !state.NextRetryAt.Equal(expectedRetry2) {
-		t.Fatalf("attempt 2 next_retry_at = %v, want %v", state.NextRetryAt, expectedRetry2)
+	expectedRetryAfter := clock.Now().Add(2 * time.Minute)
+	if !state.NextRetryAt.Equal(expectedRetryAfter) {
+		t.Fatalf("Retry-After next_retry_at = %v, want %v", state.NextRetryAt, expectedRetryAfter)
 	}
 
-	// Advance clock to second retry time (05:04)
-	clock.Advance(2 * time.Minute)
-
-	// Attempt 3: Retry 2 fails (max 3 attempts exhausted)
-	if err := runtime.DispatchRetries(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	state = runtime.store.Credential("codex-a")
-	if state.Attempts != 3 || state.Failures != 3 || state.RetryCount != 3 {
-		t.Fatalf("attempt 3 state: attempts=%d, failures=%d, retry_count=%d", state.Attempts, state.Failures, state.RetryCount)
-	}
-	if !state.NextRetryAt.IsZero() {
-		t.Fatalf("after 3 attempts, next_retry_at should be zero, got %v", state.NextRetryAt)
-	}
-
-	// Check nextRetryTime reports no more retries
-	_, hasRetry = runtime.nextRetryTime(runtime.store, clock.Now(), nextMilestoneTarget)
-	if hasRetry {
-		t.Fatal("hasRetry should be false after 3 attempts")
-	}
-
-	// Advancing and dispatching retries again should do nothing
-	clock.Advance(2 * time.Minute)
-	if err := runtime.DispatchRetries(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	state = runtime.store.Credential("codex-a")
-	if state.Attempts != 3 {
-		t.Fatalf("attempts after exhausted retries = %d, want 3", state.Attempts)
-	}
-
-	// Verify successful retry behavior on a separate fresh credential / reset
-	file2, document2 := credential("codex-b", "token-b", 1)
-	host.auths = append(host.auths, file2)
-	host.docs[file2.AuthIndex] = document2
-
-	// Initial attempt for codex-b fails
-	if err := runtime.DispatchMilestone(t.Context(), milestoneKey, milestoneTime); err != nil {
-		t.Fatal(err)
-	}
-	stateB := runtime.store.Credential("codex-b")
-	if stateB.RetryCount != 1 {
-		t.Fatalf("codex-b retry_count = %d, want 1", stateB.RetryCount)
-	}
-
-	// Upstream recovers and succeeds
+	// Attempt 7: Upstream recovers and succeeds on retry
 	host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
 		return successStream()
 	}
@@ -752,18 +1172,15 @@ func TestMilestoneRetryTransientFailureAndMaxAttempts(t *testing.T) {
 	if err := runtime.DispatchRetries(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	stateB = runtime.store.Credential("codex-b")
-	if stateB.Attempts != 2 || stateB.Successes != 1 || stateB.RetryCount != 0 {
-		t.Fatalf("successful retry state: attempts=%d, successes=%d, retry_count=%d", stateB.Attempts, stateB.Successes, stateB.RetryCount)
+	state = runtime.store.Credential("codex-a")
+	if state.Successes != 1 || state.RetryCount != 0 || !state.NextRetryAt.IsZero() {
+		t.Fatalf("successful retry state = %#v", state)
 	}
-	if !stateB.NextRetryAt.IsZero() {
-		t.Fatalf("successful retry should have zero next_retry_at, got %v", stateB.NextRetryAt)
+	if state.Status != "waiting" || state.Reason != "milestone_ping_succeeded" {
+		t.Fatalf("successful retry status/reason = (%q, %q)", state.Status, state.Reason)
 	}
-	if stateB.Status != "waiting" || stateB.Reason != "milestone_ping_succeeded" {
-		t.Fatalf("successful retry status/reason = (%q, %q)", stateB.Status, stateB.Reason)
-	}
-	if stateB.LastProcessedMilestone != milestoneKey {
-		t.Fatalf("successful retry milestone = %q, want %q", stateB.LastProcessedMilestone, milestoneKey)
+	if state.LastProcessedMilestone != milestoneKey {
+		t.Fatalf("successful retry milestone = %q, want %q", state.LastProcessedMilestone, milestoneKey)
 	}
 }
 
@@ -781,28 +1198,37 @@ func TestMilestoneRetrySupersededByNextMilestone(t *testing.T) {
 
 	startupDelay := 24 * time.Hour
 	runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
-	cfg := testConfig(t, runtime, "retry_cooldown: 5m\nschedule:\n  - \"05:00\"\n  - \"05:02\"\ntimezone: UTC\n")
+	cfg := testConfig(t, runtime, "retry_cooldown: 1m\nschedule:\n  - \"05:00\"\n  - \"05:02\"\ntimezone: UTC\n")
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	if err := runtime.Configure(t.Context(), cfg); err != nil {
 		t.Fatal(err)
 	}
 	defer runtime.Shutdown(t.Context())
 
-	// Milestone 05:00 fails, scheduling retry at 05:05 (cooldown 5m)
+	// Milestone 05:00 fails, scheduling retry at 05:01 (before 05:02)
 	if err := runtime.DispatchMilestone(t.Context(), "2026-09-18#05:00", clock.Now()); err != nil {
 		t.Fatal(err)
 	}
 	state := runtime.store.Credential("codex-a")
-	if state.RetryCount != 1 || !state.NextRetryAt.Equal(clock.Now().Add(5*time.Minute)) {
+	if state.RetryCount != 1 || !state.NextRetryAt.Equal(clock.Now().Add(time.Minute)) {
 		t.Fatalf("state after 05:00 failure = %#v", state)
 	}
 
-	// Next milestone target is 05:02:00
+	// Advance clock to 05:01: retry 1 fails, scheduling retry at 05:02
+	// 05:02 is AT next milestone, so it hits the cycle boundary and NextRetryAt becomes zero!
+	clock.Advance(time.Minute)
+	if err := runtime.DispatchRetries(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	state = runtime.store.Credential("codex-a")
+	if !state.NextRetryAt.IsZero() {
+		t.Fatalf("retry at or after cycle boundary (05:02) should have zero NextRetryAt, got %v", state.NextRetryAt)
+	}
+
 	nextMilestoneTarget := time.Date(2026, 9, 18, 5, 2, 0, 0, time.UTC)
-	// Pending retry is at 05:05:00, which is AFTER 05:02:00. Next milestone supersedes pending retry.
-	_, hasRetry := runtime.nextRetryTime(runtime.store, clock.Now(), nextMilestoneTarget)
+	_, hasRetry := runtime.nextRetryTime(runtime.store, clock.Now(), nextMilestoneTarget, "2026-09-18#05:00")
 	if hasRetry {
-		t.Fatal("pending retry at 05:05 should be superseded by next milestone at 05:02")
+		t.Fatal("hasRetry should be false when retry reached next milestone boundary")
 	}
 
 	// Advance clock to next milestone 05:02:00
@@ -823,8 +1249,343 @@ func TestMilestoneRetrySupersededByNextMilestone(t *testing.T) {
 		t.Fatalf("superseding milestone status = (%q, %q)", state.Status, state.Reason)
 	}
 }
+func TestMilestoneRetryStopsAtConfiguredTimezoneMidnight(t *testing.T) {
+	loc, err := time.LoadLocation("Asia/Ho_Chi_Minh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2026-09-18 23:59:00 in Asia/Ho_Chi_Minh (+07:00)
+	now := time.Date(2026, 9, 18, 23, 59, 0, 0, loc)
+	clock := &fakeClock{now: now}
+	host := newFakeHost()
+	file, document := credential("codex-a", "token-a", 1)
+	host.auths = []AuthFile{file}
+	host.docs[file.AuthIndex] = document
 
-func TestMilestoneAuthBlockImmediateAndUnblockOnVersionChange(t *testing.T) {
+	host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+		return HTTPStreamResponse{StatusCode: http.StatusInternalServerError}, []HTTPStreamChunk{{Done: true}}, nil
+	}
+
+	startupDelay := 24 * time.Hour
+	runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
+	cfg := testConfig(t, runtime, "schedule:\n  - \"23:59\"\n  - \"05:00\"\nretry_cooldown: 2m\ntimezone: Asia/Ho_Chi_Minh\n")
+	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
+	if err := runtime.Configure(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Shutdown(t.Context())
+
+	// Milestone 23:59 fails. 23:59 + 2m cooldown = 00:01 next day.
+	// Midnight boundary is 00:00, which is earlier than next milestone 05:00.
+	// Therefore retryTarget (00:01) is after midnight (00:00) and NextRetryAt must be zero!
+	milestoneKey := "2026-09-18#23:59"
+	if err := runtime.DispatchMilestone(t.Context(), milestoneKey, clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	state := runtime.store.Credential("codex-a")
+	if !state.NextRetryAt.IsZero() {
+		t.Fatalf("retry beyond configured timezone midnight should have zero NextRetryAt, got %v", state.NextRetryAt)
+	}
+}
+
+func TestMilestoneRetryHTTPDateAndInvalidRetryAfter(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clock := &fakeClock{now: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)}
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.docs[file.AuthIndex] = document
+
+		var retryHeader atomic.Pointer[string]
+		host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			headers := http.Header{}
+			if p := retryHeader.Load(); p != nil && *p != "" {
+				headers.Set("Retry-After", *p)
+			}
+			return HTTPStreamResponse{StatusCode: http.StatusTooManyRequests, Headers: headers}, []HTTPStreamChunk{{Done: true}}, nil
+		}
+
+		runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: new(time.Duration)})
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		cfgYAML := "schedule:\n  - \"00:01\"\n  - \"05:00\"\nretry_cooldown: 1m\ntimezone: UTC\nstate_path: " + statePath + "\n"
+		reconfReq, _ := json.Marshal(map[string]string{"config_yaml": cfgYAML})
+		reconfResp := runtime.Handle(t.Context(), "plugin.reconfigure", reconfReq)
+		var envelope struct {
+			OK bool `json:"ok"`
+		}
+		if err := json.Unmarshal(reconfResp, &envelope); err != nil || !envelope.OK {
+			t.Fatalf("reconfigure failed: %s", string(reconfResp))
+		}
+		defer runtime.Shutdown(t.Context())
+
+		// Future HTTP-date: 00:04:00 (3 minutes from 00:01)
+		futureDate := time.Date(2000, 1, 1, 0, 4, 0, 0, time.UTC)
+		hFuture := futureDate.Format(http.TimeFormat)
+		retryHeader.Store(&hFuture)
+
+		// Advance clock into 00:01:00
+		clock.Advance(time.Minute)
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		// Query status to observe next_retry_at
+		statusReq, _ := json.Marshal(managementRequest{Method: "GET", Path: "/v0/management/cliproxyapi-auto-ping/status"})
+		rawStatus := runtime.Handle(t.Context(), "management.handle", statusReq)
+		decoded := decodeManagementResponse(t, rawStatus)
+		var payload struct {
+			Accounts []struct {
+				NextRetryAt string `json:"next_retry_at"`
+			} `json:"accounts"`
+		}
+		if err := json.Unmarshal(decoded.Body, &payload); err != nil || len(payload.Accounts) == 0 {
+			t.Fatalf("decode status failed: %v, body: %s", err, string(decoded.Body))
+		}
+		expectedFuture := futureDate.Format(time.RFC3339)
+		if payload.Accounts[0].NextRetryAt != expectedFuture {
+			t.Fatalf("future HTTP-date next_retry_at = %q, want %q", payload.Accounts[0].NextRetryAt, expectedFuture)
+		}
+
+		// Past HTTP-date: falls back to 1m cooldown
+		pastDate := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+		hPast := pastDate.Format(http.TimeFormat)
+		retryHeader.Store(&hPast)
+
+		// Advance clock to 00:04:00
+		clock.Advance(3 * time.Minute)
+		time.Sleep(3 * time.Minute)
+		synctest.Wait()
+
+		rawStatus = runtime.Handle(t.Context(), "management.handle", statusReq)
+		decoded = decodeManagementResponse(t, rawStatus)
+		_ = json.Unmarshal(decoded.Body, &payload)
+		expectedFallback := time.Date(2000, 1, 1, 0, 5, 0, 0, time.UTC).Format(time.RFC3339)
+		if payload.Accounts[0].NextRetryAt != expectedFallback {
+			t.Fatalf("past HTTP-date next_retry_at = %q, want %q", payload.Accounts[0].NextRetryAt, expectedFallback)
+		}
+
+		// Malformed header: falls back to 1m cooldown
+		hInvalid := "invalid-header"
+		retryHeader.Store(&hInvalid)
+
+		// Advance clock to 00:05:00
+		clock.Advance(time.Minute)
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		rawStatus = runtime.Handle(t.Context(), "management.handle", statusReq)
+		decoded = decodeManagementResponse(t, rawStatus)
+		_ = json.Unmarshal(decoded.Body, &payload)
+		expectedFallback2 := time.Date(2000, 1, 1, 0, 6, 0, 0, time.UTC).Format(time.RFC3339)
+		if payload.Accounts[0].NextRetryAt != expectedFallback2 {
+			t.Fatalf("malformed header next_retry_at = %q, want %q", payload.Accounts[0].NextRetryAt, expectedFallback2)
+		}
+	})
+}
+
+func TestMilestoneTerminalModelAndBusinessFailuresDoNotRetry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakeHost()
+		fileA, docA := credential("codex-model", "token-a", 1)
+		fileB, docB := credential("codex-biz", "token-b", 1)
+		host.auths = []AuthFile{fileA, fileB}
+		host.docs[fileA.AuthIndex] = docA
+		host.docs[fileB.AuthIndex] = docB
+
+		host.httpStreamFunc = func(req HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			acct := req.Headers.Get("ChatGPT-Account-ID")
+			if acct == "account-codex-model" {
+				return HTTPStreamResponse{StatusCode: http.StatusNotFound}, []HTTPStreamChunk{{Done: true}}, nil
+			}
+			return HTTPStreamResponse{StatusCode: http.StatusUnprocessableEntity}, []HTTPStreamChunk{{Payload: []byte(`{"error":{"message":"usage_limit"}}`), Done: true}}, nil
+		}
+
+		runtime := newTestRuntime(t, host, Options{StartupDelay: new(time.Duration)})
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		cfgYAML := "schedule:\n  - \"00:01\"\n  - \"05:00\"\nretry_cooldown: 1m\ntimezone: UTC\nmodel: gpt-5.5\nstate_path: " + statePath + "\n"
+		reconfReq, _ := json.Marshal(map[string]string{"config_yaml": cfgYAML})
+		reconfResp := runtime.Handle(t.Context(), "plugin.reconfigure", reconfReq)
+		var envelope struct {
+			OK bool `json:"ok"`
+		}
+		if err := json.Unmarshal(reconfResp, &envelope); err != nil || !envelope.OK {
+			t.Fatalf("reconfigure failed: %s", string(reconfResp))
+		}
+		defer runtime.Shutdown(t.Context())
+
+		// Advance into 00:01 milestone
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		statusReq, _ := json.Marshal(managementRequest{Method: "GET", Path: "/v0/management/cliproxyapi-auto-ping/status"})
+		rawStatus := runtime.Handle(t.Context(), "management.handle", statusReq)
+		decoded := decodeManagementResponse(t, rawStatus)
+		var payload struct {
+			Accounts []struct {
+				CredentialID string `json:"credential_id"`
+				NextRetryAt  string `json:"next_retry_at"`
+				Status       string `json:"status"`
+			} `json:"accounts"`
+		}
+		if err := json.Unmarshal(decoded.Body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		for _, acct := range payload.Accounts {
+			if acct.NextRetryAt != "" {
+				t.Fatalf("terminal failure for %s scheduled a retry: %q", acct.CredentialID, acct.NextRetryAt)
+			}
+		}
+
+		// Advance time by 2 minutes; streamRequestCount must remain 2 (no retries dispatched)
+		time.Sleep(2 * time.Minute)
+		synctest.Wait()
+		if host.streamRequestCount() != 2 {
+			t.Fatalf("requests count = %d, want 2 (no retries for terminal failures)", host.streamRequestCount())
+		}
+	})
+}
+func TestScheduleLoopDateRolloverResetsPriorAttemptCycles(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clock := &fakeClock{now: time.Date(2000, 1, 1, 23, 50, 0, 0, time.UTC)}
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.docs[file.AuthIndex] = document
+
+		var return500 atomic.Bool
+		return500.Store(true)
+		host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			if return500.Load() {
+				return HTTPStreamResponse{StatusCode: 500}, []HTTPStreamChunk{{Done: true}}, nil
+			}
+			return successStream()
+		}
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: new(time.Duration)})
+		cfgYAML := "schedule:\n  - \"23:55\"\n  - \"05:00\"\nretry_cooldown: 2m\ntimezone: UTC\nstate_path: " + statePath + "\n"
+		reconfReq, _ := json.Marshal(map[string]string{"config_yaml": cfgYAML})
+		reconfResp := runtime.Handle(t.Context(), "plugin.reconfigure", reconfReq)
+		var envelope struct {
+			OK bool `json:"ok"`
+		}
+		if err := json.Unmarshal(reconfResp, &envelope); err != nil || !envelope.OK {
+			t.Fatalf("reconfigure failed: %s", string(reconfResp))
+		}
+		defer runtime.Shutdown(t.Context())
+
+		// Advance to 23:55: milestone fails with 500, setting attempted_milestone="2000-01-01#23:55"
+		clock.Advance(5 * time.Minute)
+		time.Sleep(5 * time.Minute)
+		synctest.Wait()
+
+		statusReq, _ := json.Marshal(managementRequest{Method: "GET", Path: "/v0/management/cliproxyapi-auto-ping/status"})
+		rawStatus := runtime.Handle(t.Context(), "management.handle", statusReq)
+		decoded := decodeManagementResponse(t, rawStatus)
+		var payload struct {
+			Accounts []struct {
+				AttemptedMilestone string `json:"attempted_milestone"`
+				Status             string `json:"status"`
+			} `json:"accounts"`
+		}
+		if err := json.Unmarshal(decoded.Body, &payload); err != nil || len(payload.Accounts) == 0 {
+			t.Fatal("decode status failed")
+		}
+		if payload.Accounts[0].AttemptedMilestone != "2000-01-01#23:55" {
+			t.Fatalf("attempted_milestone before midnight = %q, want 2000-01-01#23:55", payload.Accounts[0].AttemptedMilestone)
+		}
+
+		// Advance time across midnight to 05:00 next day (2000-01-02 05:00)
+		return500.Store(false)
+		clock.Advance(5*time.Hour + 5*time.Minute)
+		time.Sleep(5*time.Hour + 5*time.Minute)
+		synctest.Wait()
+
+		rawStatus = runtime.Handle(t.Context(), "management.handle", statusReq)
+		decoded = decodeManagementResponse(t, rawStatus)
+		var payloadAfter struct {
+			Accounts []struct {
+				AttemptedMilestone     string `json:"attempted_milestone"`
+				LastProcessedMilestone string `json:"last_processed_milestone"`
+				Status                 string `json:"status"`
+			} `json:"accounts"`
+		}
+		if err := json.Unmarshal(decoded.Body, &payloadAfter); err != nil || len(payloadAfter.Accounts) == 0 {
+			t.Fatal("decode status after midnight failed")
+		}
+		if payloadAfter.Accounts[0].AttemptedMilestone != "2000-01-02#05:00" || payloadAfter.Accounts[0].LastProcessedMilestone != "2000-01-02#05:00" {
+			t.Fatalf("next day state after rollover = %#v", payloadAfter.Accounts[0])
+		}
+	})
+}
+
+func TestMilestoneRestartHonorsPendingRetryAndRejectsTerminalReattempt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clock := &fakeClock{now: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)}
+		host := newFakeHost()
+		fileRecoverable, docRecoverable := credential("codex-rec", "token-a", 1)
+		fileTerminal, docTerminal := credential("codex-term", "token-b", 1)
+		host.auths = []AuthFile{fileRecoverable, fileTerminal}
+		host.docs[fileRecoverable.AuthIndex] = docRecoverable
+		host.docs[fileTerminal.AuthIndex] = docTerminal
+
+		host.httpStreamFunc = func(req HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			acct := req.Headers.Get("ChatGPT-Account-ID")
+			if acct == "account-codex-rec" {
+				return HTTPStreamResponse{StatusCode: 500}, []HTTPStreamChunk{{Done: true}}, nil
+			}
+			return HTTPStreamResponse{StatusCode: 401}, []HTTPStreamChunk{{Done: true}}, nil
+		}
+
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: new(time.Duration)})
+		cfgYAML := "schedule:\n  - \"00:01\"\n  - \"05:00\"\nretry_cooldown: 2m\ntimezone: UTC\nstate_path: " + statePath + "\n"
+		reconfReq, _ := json.Marshal(map[string]string{"config_yaml": cfgYAML})
+		reconfResp := runtime.Handle(t.Context(), "plugin.reconfigure", reconfReq)
+		var envelope struct {
+			OK bool `json:"ok"`
+		}
+		if err := json.Unmarshal(reconfResp, &envelope); err != nil || !envelope.OK {
+			t.Fatalf("reconfigure failed: %s", string(reconfResp))
+		}
+
+		// Advance into 00:01 milestone (00:01:00)
+		clock.Advance(time.Minute)
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		shutdownReq, _ := json.Marshal(map[string]any{})
+		_ = runtime.Handle(t.Context(), "plugin.shutdown", shutdownReq)
+
+		// Advance 30 seconds (now 00:01:30, before next retry at 00:03:00)
+		clock.Advance(30 * time.Second)
+		time.Sleep(30 * time.Second)
+
+		// Restart runtime via lifecycle Handle with the same fakeClock
+		restarted := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: new(time.Duration)})
+		reconfResp = restarted.Handle(t.Context(), "plugin.reconfigure", reconfReq)
+		if err := json.Unmarshal(reconfResp, &envelope); err != nil || !envelope.OK {
+			t.Fatalf("reconfigure on restart failed: %s", string(reconfResp))
+		}
+		defer restarted.Shutdown(t.Context())
+
+		// Wait briefly; at 00:01:30 no retry should run yet
+		synctest.Wait()
+		if host.streamRequestCount() != 2 {
+			t.Fatalf("requests at 00:01:30 = %d, want 2 (no premature retry)", host.streamRequestCount())
+		}
+
+		// Advance to 00:03:05 (past 00:03:00 retry)
+		clock.Advance(95 * time.Second)
+		time.Sleep(95 * time.Second)
+		synctest.Wait()
+
+		// Exactly codex-rec retries (3 total requests); codex-term does not reattempt
+		if host.streamRequestCount() != 3 {
+			t.Fatalf("requests after retry time = %d, want 3 (only recoverable retried)", host.streamRequestCount())
+		}
+	})
+}
+
+func TestMilestoneAuthFailureDoesNotRetryButNextMilestoneAttemptsAgain(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 9, 18, 5, 0, 0, 0, time.UTC)}
 	host := newFakeHost()
 	file, document := credential("codex-a", "token-a", 1)
@@ -851,43 +1612,34 @@ func TestMilestoneAuthBlockImmediateAndUnblockOnVersionChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Immediately marked blocked, reason credential_unchanged_after_auth_failure, zero retries
+	// Authentication failure is terminal for this cycle and has no pending retry.
 	state := runtime.store.Credential("codex-a")
 	if state.Status != "blocked" {
 		t.Fatalf("status = %q, want blocked", state.Status)
 	}
-	if state.Reason != "credential_unchanged_after_auth_failure" {
-		t.Fatalf("reason = %q, want credential_unchanged_after_auth_failure", state.Reason)
-	}
-	if state.BlockedCredentialVersion != file.VersionKey() {
-		t.Fatalf("blocked version = %q, want %q", state.BlockedCredentialVersion, file.VersionKey())
+	if state.Reason != "credential_authentication_failed" {
+		t.Fatalf("reason = %q, want credential_authentication_failed", state.Reason)
 	}
 	if state.RetryCount != 0 || !state.NextRetryAt.IsZero() {
 		t.Fatalf("auth failure should have 0 retries and zero NextRetryAt: retry_count=%d, next_retry_at=%v", state.RetryCount, state.NextRetryAt)
 	}
-
-	// nextRetryTime must return false (no retries for auth failure)
+	// nextRetryTime must return false (no retries for auth failure in current cycle)
 	nextMilestoneTarget := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
-	_, hasRetry := runtime.nextRetryTime(runtime.store, clock.Now(), nextMilestoneTarget)
+	_, hasRetry := runtime.nextRetryTime(runtime.store, clock.Now(), nextMilestoneTarget, "2026-09-18#05:00")
 	if hasRetry {
-		t.Fatal("hasRetry should be false for auth-blocked credential")
+		t.Fatal("hasRetry should be false for auth failure")
 	}
 
-	// Next milestone at 10:00: credential is still unchanged, so it should be skipped
+	// Next milestone at 10:00: credential is fresh and attempted again even if unchanged
 	clock.Advance(5 * time.Hour)
 	initialRequests := host.streamRequestCount()
 	if err := runtime.DispatchMilestone(t.Context(), "2026-09-18#10:00", clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if host.streamRequestCount() != initialRequests {
-		t.Fatalf("auth-blocked credential was not skipped; requests = %d, want %d", host.streamRequestCount(), initialRequests)
+	if host.streamRequestCount() != initialRequests+1 {
+		t.Fatalf("auth failure should not suppress next milestone; requests = %d, want %d", host.streamRequestCount(), initialRequests+1)
 	}
-	state = runtime.store.Credential("codex-a")
-	if state.Status != "blocked" || state.Reason != "credential_unchanged_after_auth_failure" {
-		t.Fatalf("state on subsequent dispatch = %#v", state)
-	}
-
-	// Now update credential version (token refresh)
+	// Update the credential version before the later 15:00 milestone; it remains eligible either way.
 	clock.Advance(1 * time.Hour)
 	newFile, newDoc := credential("codex-a", "token-a-refreshed", 1)
 	newFile.UpdatedAt = clock.Now()
@@ -902,15 +1654,12 @@ func TestMilestoneAuthBlockImmediateAndUnblockOnVersionChange(t *testing.T) {
 	if err := runtime.DispatchMilestone(t.Context(), "2026-09-18#15:00", clock.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if host.streamRequestCount() != initialRequests+1 {
-		t.Fatalf("unblocked credential did not receive request; requests = %d, want %d", host.streamRequestCount(), initialRequests+1)
+	if host.streamRequestCount() != initialRequests+2 {
+		t.Fatalf("unblocked credential did not receive request; requests = %d, want %d", host.streamRequestCount(), initialRequests+2)
 	}
 	state = runtime.store.Credential("codex-a")
 	if state.Status != "waiting" || state.Reason != "milestone_ping_succeeded" {
 		t.Fatalf("unblocked state: status=%q, reason=%q", state.Status, state.Reason)
-	}
-	if state.BlockedCredentialVersion != "" {
-		t.Fatalf("blocked credential version should be cleared, got %q", state.BlockedCredentialVersion)
 	}
 	if state.LastProcessedMilestone != "2026-09-18#15:00" {
 		t.Fatalf("last processed milestone = %q, want 2026-09-18#15:00", state.LastProcessedMilestone)

@@ -1,8 +1,10 @@
 package autoping
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -159,14 +161,20 @@ func configFromRaw(raw rawConfig, base Config, requireComplete bool) (Config, er
 
 func (r *Runtime) parseConfig(data []byte) (Config, error) {
 	var raw rawConfig
-	if len(strings.TrimSpace(string(data))) != 0 {
-		if err := yaml.Unmarshal(data, &raw); err != nil {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) != 0 {
+		decoder := yaml.NewDecoder(bytes.NewReader(trimmed))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(&raw); err != nil {
 			return Config{}, fmt.Errorf("%w: decode YAML: %v", ErrInvalidConfig, err)
+		}
+		var extra any
+		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+			return Config{}, fmt.Errorf("%w: multiple or invalid trailing YAML documents", ErrInvalidConfig)
 		}
 	}
 	return configFromRaw(raw, r.manifest.Defaults, false)
 }
-
 func (c Config) Models() []string {
 	if c.Model != "auto" {
 		return []string{c.Model}

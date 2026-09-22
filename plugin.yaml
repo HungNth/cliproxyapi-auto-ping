@@ -51,7 +51,7 @@ defaults:
   auto_ping_disabled: false
   schedule: ["05:00", "10:00", "15:00", "20:00"]
   timezone: "Local"
-  retry_cooldown: "2m"
+  retry_cooldown: "1m"
   max_concurrency: 1
   request_timeout: "60s"
   prompt: "ping"
