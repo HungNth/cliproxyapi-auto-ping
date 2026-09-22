@@ -84,7 +84,6 @@ type statusPayload struct {
 	Schedule        []string          `json:"schedule"`
 	Timezone        string            `json:"timezone"`
 	NextMilestoneAt string            `json:"next_milestone_at,omitempty"`
-	LastMilestone   string            `json:"last_milestone,omitempty"`
 	AutoPing        statusConfig      `json:"auto_ping"`
 	Accounts        []CredentialState `json:"accounts"`
 }
@@ -94,7 +93,6 @@ type statusConfig struct {
 	Schedule                []string `json:"schedule"`
 	Timezone                string   `json:"timezone"`
 	NextMilestoneAt         string   `json:"next_milestone_at,omitempty"`
-	LastMilestone           string   `json:"last_milestone,omitempty"`
 	RetryCooldown           string   `json:"retry_cooldown"`
 	MaxConcurrency          int      `json:"max_concurrency"`
 	RequestTimeout          string   `json:"request_timeout"`
@@ -283,6 +281,8 @@ func (r *Runtime) handleManagement(ctx context.Context, raw []byte) (managementR
 				"host.model.execute", "host.log",
 			},
 			Notes: []string{
+				"Dynamic scheduling observes https://chatgpt.com/backend-api/wham/usage for each eligible credential.",
+				"Each account reports observed_reset_at, target_trigger_at, status, reason, and failure_kind in the embedded status payload.",
 				"Auto-ping never logs or persists credential secrets.",
 				"Exactly-once delivery is impossible without upstream idempotency; rare crash duplicates are accepted.",
 			},
@@ -316,10 +316,8 @@ func (r *Runtime) handleManagement(ctx context.Context, raw []byte) (managementR
 func (r *Runtime) status() statusPayload {
 	cfg, store, _ := r.snapshot()
 	accounts := []CredentialState{}
-	var lastMilestone string
 	if store != nil {
 		accounts = store.Accounts()
-		lastMilestone = store.LastProcessedMilestone()
 	}
 	var nextMilestoneAt string
 	if cfg.AutoPingEnabled && len(cfg.Schedule) > 0 {
@@ -332,13 +330,11 @@ func (r *Runtime) status() statusPayload {
 		Schedule:        slices.Clone(cfg.Schedule),
 		Timezone:        cfg.Timezone,
 		NextMilestoneAt: nextMilestoneAt,
-		LastMilestone:   lastMilestone,
 		AutoPing: statusConfig{
 			Enabled:                 cfg.AutoPingEnabled,
 			Schedule:                slices.Clone(cfg.Schedule),
 			Timezone:                cfg.Timezone,
 			NextMilestoneAt:         nextMilestoneAt,
-			LastMilestone:           lastMilestone,
 			RetryCooldown:           cfg.RetryCooldown.String(),
 			MaxConcurrency:          cfg.MaxConcurrency,
 			RequestTimeout:          cfg.RequestTimeout.String(),

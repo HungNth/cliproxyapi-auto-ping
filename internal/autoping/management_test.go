@@ -129,13 +129,6 @@ func TestManagementStatusReportsScheduleMetadata(t *testing.T) {
 	host.docs[file.AuthIndex] = document
 
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	store, err := LoadStateStore(t.Context(), statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SetLastMilestone(t.Context(), "2026-09-18#05:00"); err != nil {
-		t.Fatal(err)
-	}
 
 	startupDelay := 24 * time.Hour
 	runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
@@ -159,7 +152,6 @@ func TestManagementStatusReportsScheduleMetadata(t *testing.T) {
 		Schedule        []string     `json:"schedule"`
 		Timezone        string       `json:"timezone"`
 		NextMilestoneAt string       `json:"next_milestone_at"`
-		LastMilestone   string       `json:"last_milestone"`
 		AutoPing        statusConfig `json:"auto_ping"`
 	}
 	if err := json.Unmarshal(response.Body, &payload); err != nil {
@@ -178,17 +170,12 @@ func TestManagementStatusReportsScheduleMetadata(t *testing.T) {
 	if payload.NextMilestoneAt != expectedNext || payload.AutoPing.NextMilestoneAt != expectedNext {
 		t.Fatalf("next_milestone_at = %q, auto_ping.next_milestone_at = %q, want %q", payload.NextMilestoneAt, payload.AutoPing.NextMilestoneAt, expectedNext)
 	}
-	if payload.LastMilestone != "2026-09-18#05:00" || payload.AutoPing.LastMilestone != "2026-09-18#05:00" {
-		t.Fatalf("last_milestone = %q, auto_ping.last_milestone = %q, want 2026-09-18#05:00", payload.LastMilestone, payload.AutoPing.LastMilestone)
-	}
 }
 
 func TestReconfigurationReschedulesNextMilestone(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 9, 18, 6, 0, 0, 0, time.UTC)}
 	host := newFakeHost()
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	store, _ := LoadStateStore(t.Context(), statePath)
-	_ = store.SetLastMilestone(t.Context(), "2026-09-18#05:00")
 
 	startupDelay := 24 * time.Hour
 	runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: &startupDelay})
@@ -212,7 +199,7 @@ func TestReconfigurationReschedulesNextMilestone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Reconfigured status has 3 milestones, next is rescheduled to 07:00, and last milestone history preserved
+	// Reconfigured status has 3 milestones and next anchor is rescheduled to 07:00.
 	status2 := runtime.status()
 	expectedSchedule := []string{"07:00", "14:00", "21:00"}
 	if !slices.Equal(status2.Schedule, expectedSchedule) {
@@ -220,9 +207,6 @@ func TestReconfigurationReschedulesNextMilestone(t *testing.T) {
 	}
 	if status2.NextMilestoneAt != "2026-09-18T07:00:00Z" {
 		t.Fatalf("reconfigured next milestone = %q, want 2026-09-18T07:00:00Z", status2.NextMilestoneAt)
-	}
-	if status2.LastMilestone != "2026-09-18#05:00" {
-		t.Fatalf("reconfigured last milestone history lost: got %q, want 2026-09-18#05:00", status2.LastMilestone)
 	}
 }
 
