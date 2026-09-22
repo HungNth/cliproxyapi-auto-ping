@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	codexUsageURL     = "https://chatgpt.com/backend-api/wham/usage"
 	codexResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
 	maxCapturedBody   = 64 * 1024
 )
@@ -74,6 +75,44 @@ func operationFailure(err error) FailureKind {
 		return typed.kind
 	}
 	return FailureTransport
+}
+func (r *Runtime) fetchUsageObservation(ctx context.Context, cfg Config, material AuthMaterial) (Observation, FailureKind, string) {
+	headers := http.Header{
+		"Authorization": {"Bearer " + material.AccessToken},
+		"Originator":    {"codex_cli_rs"},
+		"User-Agent":    {"codex_cli_rs/0.154.0"},
+	}
+	if material.AccountID != "" {
+		headers.Set("ChatGPT-Account-ID", material.AccountID)
+	}
+	requestCtx, cancel := context.WithTimeoutCause(ctx, cfg.RequestTimeout, errors.New("usage request timeout"))
+	defer cancel()
+
+	resp, err := r.host.HTTPDo(requestCtx, HTTPRequest{
+		Method: http.MethodGet, URL: codexUsageURL, Headers: headers,
+	})
+	if err != nil {
+		failure := FailureTransport
+		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+			failure = FailureTimeout
+		}
+		return Observation{}, failure, fmt.Sprintf("usage transport failed: %v", err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return Observation{}, FailureAuth, fmt.Sprintf("usage authentication failed: HTTP %d", resp.StatusCode)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		failure := FailureBusiness
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			failure = FailureRetryable
+		}
+		return Observation{}, failure, fmt.Sprintf("usage HTTP %d", resp.StatusCode)
+	}
+	obs, err := ParseFiveHourObservation(resp.Body, r.now())
+	if err != nil {
+		return Observation{}, FailureBusiness, fmt.Sprintf("parse usage: %v", err)
+	}
+	return obs, FailureNone, ""
 }
 
 func (r *Runtime) activate(ctx context.Context, cfg Config, file AuthFile, material AuthMaterial) ActivationResult {
