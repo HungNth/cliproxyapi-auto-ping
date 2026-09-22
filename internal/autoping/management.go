@@ -1,17 +1,21 @@
 package autoping
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"gopkg.in/yaml.v3"
 )
 
 type rpcEnvelope struct {
@@ -207,24 +211,56 @@ func lifecycleConfig(request []byte) ([]byte, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
+	var configBytes []byte
 	var text string
-	if err := json.Unmarshal(raw, &text); err != nil {
+	if err := json.Unmarshal(raw, &text); err == nil {
+		if strings.ContainsAny(text, ":\n{") {
+			configBytes = []byte(text)
+		} else if decoded, err := base64.StdEncoding.DecodeString(text); err == nil && utf8.Valid(decoded) {
+			configBytes = decoded
+		} else {
+			configBytes = []byte(text)
+		}
+	} else {
 		var bytesValue []byte
 		if bytesErr := json.Unmarshal(raw, &bytesValue); bytesErr != nil {
 			return nil, errors.New("config_yaml must be a string or byte array")
 		}
-		return bytesValue, nil
+		configBytes = bytesValue
 	}
-	if strings.ContainsAny(text, ":\n{") {
-		return []byte(text), nil
-	}
-	decoded, err := base64.StdEncoding.DecodeString(text)
-	if err == nil && utf8.Valid(decoded) {
-		return decoded, nil
-	}
-	return []byte(text), nil
+	return stripHostManagedFields(configBytes)
 }
 
+func stripHostManagedFields(data []byte) ([]byte, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return data, nil
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(trimmed))
+	var node yaml.Node
+	if err := decoder.Decode(&node); err != nil {
+		return nil, fmt.Errorf("decode YAML: %w", err)
+	}
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, errors.New("multiple or invalid trailing YAML documents")
+	}
+	if len(node.Content) == 0 || node.Content[0].Kind != yaml.MappingNode {
+		return data, nil
+	}
+	mapping := node.Content[0]
+	newContent := make([]*yaml.Node, 0, len(mapping.Content))
+	for i := 0; i < len(mapping.Content); i += 2 {
+		keyNode := mapping.Content[i]
+		valNode := mapping.Content[i+1]
+		if keyNode.Value == "enabled" || keyNode.Value == "priority" {
+			continue
+		}
+		newContent = append(newContent, keyNode, valNode)
+	}
+	mapping.Content = newContent
+	return yaml.Marshal(&node)
+}
 func (r *Runtime) routePath(suffix string) string {
 	return "/" + r.manifest.ID + suffix
 }

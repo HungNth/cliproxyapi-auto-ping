@@ -3,6 +3,7 @@ package autoping
 import (
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -174,5 +175,55 @@ func TestLifecycleRejectsObsoleteAndUnknownConfigKeys(t *testing.T) {
 				t.Fatalf("%s response = %s, want invalid_config error", tc.method, string(resp))
 			}
 		})
+	}
+}
+func TestLifecycleAcceptsHostOwnedFieldsWhileRejectingUnknownKeys(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	runtime := newTestRuntime(t, newFakeHost(), Options{})
+	cfgYAML := "enabled: true\npriority: 1\nschedule:\n  - \"05:00\"\ntimezone: UTC\nstate_path: " + statePath + "\n"
+	req, err := json.Marshal(map[string]string{"config_yaml": cfgYAML})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := runtime.Handle(t.Context(), "plugin.register", req)
+	var envelope struct {
+		OK     bool            `json:"ok"`
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(resp, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if !envelope.OK {
+		t.Fatalf("register failed with host fields (string): %s", string(resp))
+	}
+
+	byteReq, _ := json.Marshal(map[string][]byte{"config_yaml": []byte(cfgYAML)})
+	byteResp := runtime.Handle(t.Context(), "plugin.reconfigure", byteReq)
+	var byteEnvelope struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal(byteResp, &byteEnvelope); err != nil || !byteEnvelope.OK {
+		t.Fatalf("reconfigure failed with host fields (bytes): %s", string(byteResp))
+	}
+
+	invalidYAML := "enabled: true\npriority: 1\nenabled_typo: true\nstate_path: " + statePath + "\n"
+	invalidReq, _ := json.Marshal(map[string]string{"config_yaml": invalidYAML})
+	invalidResp := runtime.Handle(t.Context(), "plugin.reconfigure", invalidReq)
+	var invalidEnvelope struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(invalidResp, &invalidEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	if invalidEnvelope.OK || invalidEnvelope.Error.Code != "invalid_config" {
+		t.Fatalf("reconfigure expected invalid_config, got %s", string(invalidResp))
 	}
 }
