@@ -1,6 +1,6 @@
 # CLIProxyAPI Codex 5h Auto-Ping
 
-A native [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that sends one minimal, credential-targeted Codex inference request at each configured daily milestone.
+A native [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that observes each Codex credential's five-hour quota boundary and sends one minimal targeted request after that boundary.
 
 > Auto-Ping consumes a small amount of real Codex quota. It does not increase, reset, bypass, or create quota and does not change OpenAI subscription or rate-limit policy.
 
@@ -8,17 +8,15 @@ A native [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that
 
 For every eligible Codex credential, the plugin:
 
-1. waits for the next daily milestone in the configured timezone (`05:00`, `10:00`, `15:00`, `20:00` by default);
-2. discovers credentials through `host.auth.list` and reads their material through `host.auth.get`, without pre-flight quota polling;
-3. sends a tiny streaming request directly to `https://chatgpt.com/backend-api/codex/responses` with each eligible credential, bounded by `max_concurrency`;
-4. waits for any manual ping already using that credential, then rechecks whether the milestone was processed;
-5. records each credential's successful milestone atomically so restarts do not normally duplicate the ping.
+1. waits until the first configured daily milestone (`05:00` by default) before initial discovery; startup after that milestone catches up immediately;
+2. reads `GET https://chatgpt.com/backend-api/wham/usage` and selects the `limit_window_seconds: 18000` window;
+3. schedules the credential independently at the observed `reset_at + 30s`; the 30-second margin mitigates boundary timing risk but is not an upstream guarantee;
+4. sends a tiny streaming request to `https://chatgpt.com/backend-api/codex/responses`, bounded by `max_concurrency` and serialized with manual pings for the same credential;
+5. re-observes usage after success and schedules the next cycle only after `reset_at` advances.
 
-A successful request is recorded only after a valid Codex response stream completes. If the process crashes after upstream success but before the state write, one rare duplicate is possible; pre-marking the cycle was rejected because it could silently lose the activation.
+Recoverable usage or inference failures retry after `retry_cooldown`. Authentication, model, and business failures end the current attempt cycle; later configured schedule entries start a fresh cycle. Reconfiguration preserves persisted targets and retry/terminal state while replacing the running scheduler without overlap.
 
-While the plugin remains running, milestones reached during a slow batch or retry remain pending rather than being skipped. Requests may start later than the milestone when the worker pool is busy. A temporary credential-list failure keeps the milestone pending and retries discovery after `retry_cooldown`.
-
-On startup, enablement, or reconfiguration, catch-up considers only today's most recent elapsed milestone in the configured schedule timezone and dispatches unprocessed eligible credentials immediately. Before today's first milestone, it waits instead. Reconfiguration cancels the old timer and queued work, waits for any in-flight scanner execution to exit, and then activates the replacement schedule without scheduler overlap.
+The private usage endpoint can fail, return stale data, or change shape. A stale post-ping observation keeps the credential in stabilization and retries observation without sending another inference request.
 
 The plugins are independent and may be enabled together. This plugin does not modify `quota-activation` behavior or state.
 
@@ -38,6 +36,7 @@ plugins:
             # Default: false. Set to true to opt out of background requests.
             auto_ping_disabled: false
 
+            # The first entry anchors initial discovery. Later entries bound terminal cycles.
             schedule:
                 - "05:00"
                 - "10:00"
@@ -78,8 +77,8 @@ An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the p
 | Field                      | Default                            | Meaning                                                    |
 | -------------------------- | ---------------------------------- | ---------------------------------------------------------- |
 | `auto_ping_disabled`       | `false`                            | Set to `true` to opt out of background inference requests  |
-| `schedule`                 | `["05:00", "10:00", "15:00", "20:00"]` | Daily auto-ping milestone times in 24-hour format      |
-| `timezone`                 | `Local`                            | Timezone for daily schedule milestones                     |
+| `schedule`                 | `["05:00", "10:00", "15:00", "20:00"]` | First entry anchors discovery; later entries start fresh terminal cycles |
+| `timezone`                 | `Local`                            | Timezone for schedule anchors                              |
 | `retry_cooldown`           | `1m`                               | Delay before retrying after an activation failure          |
 | `max_concurrency`          | `1`                                | Maximum credentials processed concurrently                 |
 | `request_timeout`          | `60s`                              | Inference operation timeout                               |
@@ -89,18 +88,19 @@ An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the p
 | `scheduler_boost_fallback` | `true`                             | Fallback only for host/transport failures                  |
 | `state_path`               | `cliproxyapi-auto-ping/state.json` | Persistent state location                                  |
 
-> **Upgrade notice (State Schema v2):** This release performs an intentionally destructive state schema cutover. Existing version 1 state files are rejected on startup and configuration. Operators upgrading from an earlier version must remove the existing `state.json` file or point `state_path` to a new location before enabling this release.
+> **Upgrade notice (State Schema v3):** Existing version 1 and version 2 state files are rejected with an actionable startup/configuration error. Remove the old `state.json` file or select a new `state_path` before enabling this release.
+
 ## Eligibility and failure handling
 
-The scheduler skips disabled, revoked, explicitly excluded, and non-Codex credentials. The host's temporary `unavailable` flag alone does not exclude a credential, and prior authentication failure does not suppress a subsequent milestone. A successful milestone is deduplicated per credential, not by the global milestone marker.
+The scheduler skips disabled, revoked, explicitly excluded, and non-Codex credentials. The host's temporary `unavailable` flag alone does not exclude a credential.
 
-- Credential material read failure, network/stream failure, rate limit (HTTP 429), or temporary upstream failure: retry after the later of `retry_cooldown` and upstream `Retry-After` without a fixed attempt cap until success, the next milestone, midnight in the configured schedule timezone, or reconfiguration.
-- Invalid authentication, model failure, or business rejection: terminal for the current cycle with no minute retries, but a fresh attempt cycle begins at the next scheduled milestone.
+- Credential material, transport, timeout, HTTP 429, or upstream 5xx failure: retry usage observation or inference after `retry_cooldown`.
+- Invalid authentication, model failure, business rejection, missing five-hour window, or invalid usage payload: terminal for the current cycle; retry fresh at the next configured schedule anchor.
 - Unsupported auto-selected model: try the next configured candidate once.
 - Explicit model failure: do not silently change models.
 - Direct business/authentication errors: never invoke scheduler fallback.
 
-Being scheduled guarantees an attempt under these eligibility rules, not upstream success. An active cycle continues retrying recoverable errors until its cycle boundary (the next milestone, configured-timezone midnight, or reconfiguration), while terminal failures (such as authentication or business rejections) wait for the next scheduled milestone to start fresh.
+Scheduling guarantees an attempt under these eligibility rules, not that upstream will activate or reset quota. `/wham/usage` is an observed private API contract, not an authoritative real-time guarantee.
 
 `scheduler_boost_fallback` temporarily raises the target credential's priority, adds a one-time nonce, and accepts success only if the plugin scheduler confirms that CLIProxyAPI selected the intended credential. The original priority is restored from the latest credential document so a concurrent token refresh is not overwritten.
 
@@ -124,9 +124,9 @@ Manual ping body:
 }
 ```
 
-Manual pings do not mark a milestone processed unless `mark_cycle_processed` is true. When true, a successful manual ping records the latest elapsed milestone of the current day. An overlapping automatic dispatch rechecks this marker before sending another request.
+Manual pings do not advance the dynamic cycle unless `mark_cycle_processed` is true. When true, a successful manual ping re-observes `/wham/usage` and anchors the next dynamic cycle at `reset_at + 30s` only after upstream reset strictly advances. If usage observation fails or returns a stale reset, the account transitions to `stabilizing` and retries observation without duplicating inference.
 
-Status and diagnostics expose credential IDs, milestone history, decisions, counters, selected model, transport, retry timing, and sanitized errors. The global `last_milestone` identifies the last evaluated batch; inspect each credential's `last_processed_milestone` and `last_attempt_status` to confirm success. Access tokens, refresh tokens, authorization headers, cookies, and raw credential JSON are never persisted or returned.
+Status and diagnostics expose credential IDs, `observed_reset_at`, `target_trigger_at`, `last_processed_reset_at`, decisions, counters, selected model, transport, retry timing, and sanitized errors. Access tokens, refresh tokens, authorization headers, cookies, and raw credential JSON are never persisted or returned.
 
 ## Build
 

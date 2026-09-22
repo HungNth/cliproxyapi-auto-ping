@@ -9,22 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Retry recoverable Auto-Ping failures (timeouts, transport, HTTP 429, 5xx) with 1-minute default cooldown and upstream `Retry-After` header support until success, the next milestone, midnight in the configured timezone, or reconfiguration.
-- Distinguish current-cycle attempted milestone and failure classification from success-only processed milestones in state document v2.
+- Dynamic per-credential five-hour scheduling anchored to observed `GET /backend-api/wham/usage` reset timestamps.
+- Lossless integer Unix-second parsing for production `reset_at` payloads, with explicit candidate paths and stale-observation stabilization.
 - Public Linux plugin installer script (`scripts/install/linux.sh`) to automatically resolve the latest release, verify SHA-256 checksums, and atomically install the plugin library to `~/cliproxyapi/plugins/linux/<arch>/cliproxyapi-auto-ping.so`.
 
 ### Changed
 
-- Default `retry_cooldown` changed from `2m` to `1m`.
-- Remove fixed 3-attempt retry cap on recoverable failures within an active milestone cycle.
-- Prior authentication failures and temporary cooldowns no longer block credentials on subsequent schedule milestones.
-- Startup catch-up threshold (< 1 hour) removed: startup now always catches up the latest elapsed milestone of the current calendar day in the configured schedule timezone.
-- Reconfiguration performs atomic handoff by draining old in-flight scheduler execution before starting replacement schedules.
+- Automatic requests run at `reset_at + 30s`; the margin mitigates boundary timing risk but does not guarantee upstream quota behavior.
+- The first configured schedule entry anchors initial discovery; later entries start fresh cycles after terminal authentication, model, or business failures.
+- Recoverable usage/inference failures retry after `retry_cooldown`; stale post-ping usage observations retry without sending duplicate inference requests.
+- Reconfiguration preserves persisted targets, cooldowns, and terminal-cycle state while atomically replacing the scheduler.
 - Plugin configuration enforces strict known-field decoding and rejects obsolete `scan_interval` and `activation_delay` settings.
 
 ### Removed
 
-- State schema version 1 is unsupported; state v2 destructive cutover is enforced without legacy migration shims.
+- Fixed wall-clock inference dispatch and milestone-specific retry/state bookkeeping.
+- State schema versions 1 and 2; state v3 is a destructive cutover without migration shims.
 
 ## [0.2.2] - 2026-09-19
 
