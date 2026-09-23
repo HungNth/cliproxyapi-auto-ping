@@ -395,3 +395,172 @@ func TestDynamicScheduleStaleStabilizationRetriesUsageOnlyAndAdvancesCycle(t *te
 		}
 	})
 }
+
+func TestDynamicScheduleLastMilestoneOfDayWaitsForNextDayInitialAnchor(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.docs[file.AuthIndex] = document
+
+		baseTime := time.Date(2026, 9, 22, 20, 0, 0, 0, time.UTC)
+		clock := &fakeClock{now: baseTime}
+
+		reset2000 := baseTime.Unix()
+		reset0100 := baseTime.Add(5 * time.Hour).Unix() // 2026-09-23 01:00:00 UTC
+		reset1000 := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC).Unix()
+
+		var usageCallCount atomic.Int32
+		host.httpDoFunc = func(req HTTPRequest) (HTTPResponse, error) {
+			count := usageCallCount.Add(1)
+			reset := reset0100
+			if count > 2 {
+				reset = reset1000
+			}
+			return HTTPResponse{
+				StatusCode: http.StatusOK,
+				Body: []byte(fmt.Sprintf(`{
+					"rate_limit": {
+						"limit_window_seconds": 18000,
+						"reset_at": %d
+					}
+				}`, reset)),
+			}, nil
+		}
+
+		var streamCalls atomic.Int32
+		host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			streamCalls.Add(1)
+			return successStream()
+		}
+
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		store, err := LoadStateStore(t.Context(), statePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Pre-anchor to 20:00 milestone (from earlier 15:00 window)
+		if err := store.Update(t.Context(), "codex-a", func(state *CredentialState) {
+			state.Status = "waiting"
+			state.ObservedResetAt = time.Unix(reset2000, 0).UTC()
+			state.TargetTriggerAt = time.Unix(reset2000+30, 0).UTC()
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: new(time.Duration)})
+		cfg := testConfig(t, runtime, "schedule: [\"05:00\", \"10:00\", \"15:00\", \"20:00\"]\ntimezone: UTC\n")
+		cfg.StatePath = statePath
+
+		if err := runtime.Configure(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Shutdown(t.Context())
+
+		// Initial discovery and ping at 20:00
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		clock.Advance(35 * time.Second)
+		time.Sleep(35 * time.Second)
+		synctest.Wait()
+
+		if streamCalls.Load() != 1 {
+			t.Fatalf("expected 1 stream ping at 20:00 milestone, got %d", streamCalls.Load())
+		}
+
+		// Advance to 01:00:30 (when the 5h window from 20:00 expires).
+		// Since 20:00 was the last milestone of the day, no ping should occur overnight at 01:00.
+		clock.Advance(5*time.Hour + 30*time.Second)
+		time.Sleep(5*time.Hour + 30*time.Second)
+		synctest.Wait()
+
+		if streamCalls.Load() != 1 {
+			t.Fatalf("expected 0 pings overnight at 01:00 after last milestone of day, got %d stream calls", streamCalls.Load())
+		}
+
+		// Advance to 05:00 of the next day (the mandatory initial daily milestone anchor).
+		clock.Advance(3*time.Hour + 59*time.Minute + 30*time.Second)
+		time.Sleep(3*time.Hour + 59*time.Minute + 30*time.Second)
+		synctest.Wait()
+
+		if streamCalls.Load() != 2 {
+			t.Fatalf("expected mandatory ping at 05:00 next day, got %d stream calls", streamCalls.Load())
+		}
+	})
+}
+
+func TestDynamicScheduleMandatory0500PingOverridesLaterTarget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakeHost()
+		file, document := credential("codex-a", "token-a", 1)
+		host.auths = []AuthFile{file}
+		host.docs[file.AuthIndex] = document
+
+		// Clock starts at exactly 05:00 UTC
+		baseTime := time.Date(2026, 9, 23, 5, 0, 0, 0, time.UTC)
+		clock := &fakeClock{now: baseTime}
+
+		reset1000 := baseTime.Add(5 * time.Hour).Unix() // 10:00 UTC
+
+		host.httpDoFunc = func(req HTTPRequest) (HTTPResponse, error) {
+			return HTTPResponse{
+				StatusCode: http.StatusOK,
+				Body: []byte(fmt.Sprintf(`{
+					"rate_limit": {
+						"limit_window_seconds": 18000,
+						"reset_at": %d
+					}
+				}`, reset1000)),
+			}, nil
+		}
+
+		var streamCalls atomic.Int32
+		host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			streamCalls.Add(1)
+			return successStream()
+		}
+
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		store, err := LoadStateStore(t.Context(), statePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Pre-populate state where a previous overnight ping set TargetTriggerAt to 06:00 UTC
+		if err := store.Update(t.Context(), "codex-a", func(state *CredentialState) {
+			state.Status = "waiting"
+			state.LastPingAt = time.Date(2026, 9, 23, 1, 0, 0, 0, time.UTC) // prior 01:00 ping before 05:00
+			state.ObservedResetAt = time.Date(2026, 9, 23, 6, 0, 0, 0, time.UTC)
+			state.TargetTriggerAt = time.Date(2026, 9, 23, 6, 0, 30, 0, time.UTC) // 06:00:30 UTC
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: new(time.Duration)})
+		cfg := testConfig(t, runtime, "schedule: [\"05:00\", \"10:00\", \"15:00\", \"20:00\"]\ntimezone: UTC\n")
+		cfg.StatePath = statePath
+
+		if err := runtime.Configure(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Shutdown(t.Context())
+
+		// At 05:00 UTC, the mandatory daily anchor ping must execute immediately, NOT wait for 06:00
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+
+		if streamCalls.Load() != 1 {
+			t.Fatalf("expected mandatory ping at 05:00 UTC despite TargetTriggerAt being 06:00, got %d stream calls", streamCalls.Load())
+		}
+
+		state := runtime.store.Credential("codex-a")
+		if state.LastAttemptStatus != "success" {
+			t.Fatalf("expected last attempt status = success, got %q", state.LastAttemptStatus)
+		}
+		// Target should now be dynamic reset from the 05:00 ping (around 10:00:30)
+		if state.TargetTriggerAt.Unix() != reset1000+30 {
+			t.Fatalf("expected new target to be 10:00:30 (%d), got %d", reset1000+30, state.TargetTriggerAt.Unix())
+		}
+	})
+}
+
+

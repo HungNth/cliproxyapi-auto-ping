@@ -321,7 +321,7 @@ func (r *Runtime) ManualPing(ctx context.Context, request ManualPingRequest) (Ma
 		}
 		current.LastProcessedResetAt = priorReset
 		current.ObservedResetAt = anchoredObs.ResetAt
-		current.TargetTriggerAt = anchoredObs.ResetAt.Add(30 * time.Second)
+		current.TargetTriggerAt = nextTargetAfterPing(completedAt, anchoredObs.ResetAt, cfg.Schedule, cfg.Location)
 		current.Status = "waiting"
 		current.Reason = "trigger_scheduled"
 		current.FailureKind = ""

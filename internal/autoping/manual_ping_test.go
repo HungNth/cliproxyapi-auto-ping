@@ -57,7 +57,8 @@ func TestManualPingMarkedCycleAnchorsDynamicCycle(t *testing.T) {
 		}, nil
 	}
 
-	runtime := newTestRuntime(t, host, Options{})
+	clock := &fakeClock{now: time.Unix(1790084449-3600, 0)}
+	runtime := newTestRuntime(t, host, Options{Now: clock.Now})
 	cfg := testConfig(t, runtime, "")
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	if err := runtime.Configure(t.Context(), cfg); err != nil {
@@ -181,7 +182,8 @@ func TestManagementHandlePingMarkedCycleAnchorsNextCycle(t *testing.T) {
 		}, nil
 	}
 
-	runtime := newTestRuntime(t, host, Options{})
+	clock := &fakeClock{now: time.Unix(1790084449-3600, 0)}
+	runtime := newTestRuntime(t, host, Options{Now: clock.Now})
 	cfg := testConfig(t, runtime, "")
 	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	if err := runtime.Configure(t.Context(), cfg); err != nil {

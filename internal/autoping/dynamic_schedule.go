@@ -85,6 +85,13 @@ func (r *Runtime) runDynamicSchedule(ctx context.Context) {
 				continue
 			}
 
+			// Mandatory daily anchor ping: if initial daily anchor (e.g. 05:00) has arrived
+			// and credential has not pinged today yet, it is immediately due.
+			if !beforeInitialAnchor && (state.LastPingAt.IsZero() || state.LastPingAt.Before(initialAnchor)) {
+				dueJobs = append(dueJobs, file)
+				continue
+			}
+
 			// Only never-anchored credentials wait for the first daily anchor.
 			// Persisted retries remain authoritative across restart.
 			if state.TargetTriggerAt.IsZero() {
@@ -122,6 +129,11 @@ func (r *Runtime) runDynamicSchedule(ctx context.Context) {
 				continue
 			}
 
+			if beforeInitialAnchor && (state.LastPingAt.IsZero() || state.LastPingAt.Before(initialAnchor)) {
+				if nextEarliestWake.IsZero() || initialAnchor.Before(nextEarliestWake) {
+					nextEarliestWake = initialAnchor
+				}
+			}
 			if state.TargetTriggerAt.IsZero() && state.Status != "stabilizing" && state.NextRetryAt.IsZero() && beforeInitialAnchor {
 				if nextEarliestWake.IsZero() || initialAnchor.Before(nextEarliestWake) {
 					nextEarliestWake = initialAnchor
@@ -231,7 +243,9 @@ func (r *Runtime) runDynamicJob(ctx context.Context, cfg Config, store *StateSto
 	if !state.NextRetryAt.IsZero() && state.NextRetryAt.After(now) {
 		return nil
 	}
-	if !state.TargetTriggerAt.IsZero() && now.Before(state.TargetTriggerAt) {
+	initialAnchor := firstDailyAnchor(now, cfg.Schedule, cfg.Location)
+	isMandatoryDailyAnchor := !now.Before(initialAnchor) && (state.LastPingAt.IsZero() || state.LastPingAt.Before(initialAnchor))
+	if !isMandatoryDailyAnchor && !state.TargetTriggerAt.IsZero() && now.Before(state.TargetTriggerAt) {
 		return nil
 	}
 	if state.Status == "stabilizing" {
@@ -334,7 +348,7 @@ func (r *Runtime) stabilizePostPing(ctx context.Context, cfg Config, store *Stat
 		}
 		obs, failure, message := r.fetchUsageObservation(ctx, cfg, material)
 		if failure == FailureNone && obs.ResetAt.After(priorReset) {
-			newTarget := obs.ResetAt.Add(30 * time.Second)
+			newTarget := nextTargetAfterPing(r.now(), obs.ResetAt, cfg.Schedule, cfg.Location)
 			if err := store.Update(ctx, credID, func(current *CredentialState) {
 				current.Status = "waiting"
 				current.Reason = "trigger_scheduled"
@@ -421,3 +435,23 @@ func (r *Runtime) recordDynamicFailure(ctx context.Context, store *StateStore, c
 	})
 	return nil
 }
+
+func nextTargetAfterPing(completedAt, resetAt time.Time, schedule []string, loc *time.Location) time.Time {
+	dynamicTrigger := resetAt.Add(30 * time.Second)
+	if len(schedule) <= 1 {
+		return dynamicTrigger
+	}
+	if loc == nil {
+		loc = time.Local
+	}
+	nextMilestone, _ := NextMilestone(completedAt, schedule, loc)
+	cLocal := completedAt.In(loc)
+	midnight := time.Date(cLocal.Year(), cLocal.Month(), cLocal.Day()+1, 0, 0, 0, 0, loc)
+	if !nextMilestone.Before(midnight) {
+		if dynamicTrigger.Before(nextMilestone) {
+			return nextMilestone
+		}
+	}
+	return dynamicTrigger
+}
+

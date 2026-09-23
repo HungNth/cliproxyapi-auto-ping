@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-09-23
+
+### Fixed
+
+- Clamp dynamic target trigger after the final daily schedule milestone (20:00) to the next calendar day's initial anchor milestone (`05:00`).
+- Enforce mandatory 05:00 AM daily anchor ping for credentials that have not pinged yet today, preventing overnight drift from delaying daytime quota resets.
+
 ## [0.2.5] - 2026-09-21
 
 ### Added
