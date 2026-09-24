@@ -123,9 +123,31 @@ func (r *Runtime) runDynamicSchedule(ctx context.Context) {
 			state := store.Credential(file.CredentialID())
 			if terminalDynamicFailure(FailureKind(state.FailureKind)) {
 				nextAnchor, _ := NextMilestone(state.LastAttemptAt, cfg.Schedule, cfg.Location)
-				if nextEarliestWake.IsZero() || nextAnchor.Before(nextEarliestWake) {
-					nextEarliestWake = nextAnchor
+				target := nextAnchor
+				if target.Before(nowAfter) {
+					target = nowAfter
 				}
+				if nextEarliestWake.IsZero() || target.Before(nextEarliestWake) {
+					nextEarliestWake = target
+				}
+				continue
+			}
+
+			// If in active retry cooldown, wake when cooldown expires
+			if !state.NextRetryAt.IsZero() {
+				target := state.NextRetryAt
+				if target.Before(nowAfter) {
+					target = nowAfter
+				}
+				if nextEarliestWake.IsZero() || target.Before(nextEarliestWake) {
+					nextEarliestWake = target
+				}
+				continue
+			}
+
+			// Stabilizing without cooldown is due immediately
+			if state.Status == "stabilizing" {
+				nextEarliestWake = nowAfter
 				continue
 			}
 
@@ -134,19 +156,18 @@ func (r *Runtime) runDynamicSchedule(ctx context.Context) {
 					nextEarliestWake = initialAnchor
 				}
 			}
-			if state.TargetTriggerAt.IsZero() && state.Status != "stabilizing" && state.NextRetryAt.IsZero() && beforeInitialAnchor {
+			if state.TargetTriggerAt.IsZero() && beforeInitialAnchor {
 				if nextEarliestWake.IsZero() || initialAnchor.Before(nextEarliestWake) {
 					nextEarliestWake = initialAnchor
 				}
 			}
-			if !state.TargetTriggerAt.IsZero() && state.TargetTriggerAt.After(nowAfter) {
-				if nextEarliestWake.IsZero() || state.TargetTriggerAt.Before(nextEarliestWake) {
-					nextEarliestWake = state.TargetTriggerAt
+			if !state.TargetTriggerAt.IsZero() {
+				target := state.TargetTriggerAt
+				if target.Before(nowAfter) {
+					target = nowAfter
 				}
-			}
-			if !state.NextRetryAt.IsZero() && state.NextRetryAt.After(nowAfter) {
-				if nextEarliestWake.IsZero() || state.NextRetryAt.Before(nextEarliestWake) {
-					nextEarliestWake = state.NextRetryAt
+				if nextEarliestWake.IsZero() || target.Before(nextEarliestWake) {
+					nextEarliestWake = target
 				}
 			}
 		}

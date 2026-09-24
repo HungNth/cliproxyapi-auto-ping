@@ -563,4 +563,84 @@ func TestDynamicScheduleMandatory0500PingOverridesLaterTarget(t *testing.T) {
 	})
 }
 
+func TestDynamicScheduleStaggeredTargetsDoNotStarveOtherCredentials(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakeHost()
+		file1, doc1 := credential("codex-1", "token-1", 1)
+		file2, doc2 := credential("codex-2", "token-2", 2)
+		host.auths = []AuthFile{file1, file2}
+		host.docs[file1.AuthIndex] = doc1
+		host.docs[file2.AuthIndex] = doc2
+
+		baseTime := time.Date(2026, 9, 24, 3, 0, 37, 0, time.UTC)
+		clock := &fakeClock{now: baseTime}
+
+		host.httpDoFunc = func(req HTTPRequest) (HTTPResponse, error) {
+			return HTTPResponse{
+				StatusCode: http.StatusOK,
+				Body: []byte(`{
+					"rate_limit": {
+						"limit_window_seconds": 18000,
+						"reset_at": 1790236841
+					}
+				}`),
+			}, nil
+		}
+
+		var streamCalls atomic.Int32
+		host.httpStreamFunc = func(HTTPRequest) (HTTPStreamResponse, []HTTPStreamChunk, error) {
+			streamCalls.Add(1)
+			return successStream()
+		}
+
+		statePath := filepath.Join(t.TempDir(), "state.json")
+		store, err := LoadStateStore(t.Context(), statePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// codex-2 is due at 03:00:37
+		if err := store.Update(t.Context(), "codex-2", func(state *CredentialState) {
+			state.Status = "waiting"
+			state.LastPingAt = time.Date(2026, 9, 23, 22, 0, 0, 0, time.UTC)
+			state.ObservedResetAt = time.Date(2026, 9, 24, 3, 0, 7, 0, time.UTC)
+			state.TargetTriggerAt = time.Date(2026, 9, 24, 3, 0, 37, 0, time.UTC)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// codex-1 is due 9 seconds later at 03:00:46
+		if err := store.Update(t.Context(), "codex-1", func(state *CredentialState) {
+			state.Status = "waiting"
+			state.LastPingAt = time.Date(2026, 9, 23, 22, 0, 0, 0, time.UTC)
+			state.ObservedResetAt = time.Date(2026, 9, 24, 3, 0, 16, 0, time.UTC)
+			state.TargetTriggerAt = time.Date(2026, 9, 24, 3, 0, 46, 0, time.UTC)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		runtime := newTestRuntime(t, host, Options{Now: clock.Now, StartupDelay: new(time.Duration)})
+		cfg := testConfig(t, runtime, "schedule: [\"05:00\", \"10:00\", \"15:00\", \"20:00\"]\ntimezone: UTC\nmax_concurrency: 1\n")
+		cfg.StatePath = statePath
+
+		if err := runtime.Configure(t.Context(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Shutdown(t.Context())
+
+		// Let codex-2 run its ping and stabilization (at least 5s).
+		// By the time codex-2 completes stabilization, clock will be >= 03:00:42.
+		time.Sleep(5 * time.Second)
+		clock.Advance(15 * time.Second) // Clock is now 03:00:52 (past codex-1's 03:00:46 target)
+		time.Sleep(15 * time.Second)
+		synctest.Wait()
+
+		// Both credentials should have been pinged by now!
+		if streamCalls.Load() != 2 {
+			t.Fatalf("expected 2 stream pings (codex-2 and codex-1), got %d", streamCalls.Load())
+		}
+	})
+}
+
+
 
