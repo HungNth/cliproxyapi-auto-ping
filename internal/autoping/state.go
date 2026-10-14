@@ -16,10 +16,24 @@ import (
 
 const stateVersion = 3
 
-type CredentialState struct {
-	CredentialID         string    `json:"credential_id"`
-	Provider             string    `json:"provider"`
-	Status               string    `json:"status"`
+const (
+	ProviderCodex       = "codex"
+	ProviderAntigravity = "antigravity"
+
+	AntigravityModelGemini = "gemini-3.8-flash-high"
+	AntigravityModelClaude = "claude-sonnet-4-6"
+
+	TargetKeyGemini5h = "gemini_5h"
+	TargetKeyClaude5h = "claude_5h"
+
+	TransportHostModel = "host_model"
+)
+
+type TargetState struct {
+	Target               string    `json:"target,omitempty"`
+	ModelFamily          string    `json:"model_family,omitempty"`
+	SelectedModel        string    `json:"selected_model,omitempty"`
+	Status               string    `json:"status,omitempty"`
 	Reason               string    `json:"reason,omitempty"`
 	FailureKind          string    `json:"failure_kind,omitempty"`
 	ObservedResetAt      time.Time `json:"observed_reset_at,omitzero"`
@@ -31,11 +45,33 @@ type CredentialState struct {
 	LastError            string    `json:"last_error,omitempty"`
 	NextRetryAt          time.Time `json:"next_retry_at,omitzero"`
 	RetryCount           int       `json:"retry_count,omitzero"`
-	SelectedModel        string    `json:"selected_model,omitempty"`
 	Transport            string    `json:"transport,omitempty"`
 	Attempts             uint64    `json:"attempts,omitzero"`
 	Successes            uint64    `json:"successes,omitzero"`
 	Failures             uint64    `json:"failures,omitzero"`
+}
+
+type CredentialState struct {
+	CredentialID         string                 `json:"credential_id"`
+	Provider             string                 `json:"provider"`
+	Status               string                 `json:"status"`
+	Reason               string                 `json:"reason,omitempty"`
+	FailureKind          string                 `json:"failure_kind,omitempty"`
+	ObservedResetAt      time.Time              `json:"observed_reset_at,omitzero"`
+	TargetTriggerAt      time.Time              `json:"target_trigger_at,omitzero"`
+	LastProcessedResetAt time.Time              `json:"last_processed_reset_at,omitzero"`
+	LastAttemptAt        time.Time              `json:"last_attempt_at,omitzero"`
+	LastAttemptStatus    string                 `json:"last_attempt_status,omitempty"`
+	LastPingAt           time.Time              `json:"last_ping_at,omitzero"`
+	LastError            string                 `json:"last_error,omitempty"`
+	NextRetryAt          time.Time              `json:"next_retry_at,omitzero"`
+	RetryCount           int                    `json:"retry_count,omitzero"`
+	SelectedModel        string                 `json:"selected_model,omitempty"`
+	Transport            string                 `json:"transport,omitempty"`
+	Attempts             uint64                 `json:"attempts,omitzero"`
+	Successes            uint64                 `json:"successes,omitzero"`
+	Failures             uint64                 `json:"failures,omitzero"`
+	Targets              map[string]TargetState `json:"targets,omitempty"`
 }
 
 type StateDocument struct {
@@ -175,5 +211,9 @@ func (s *StateStore) saveLocked(ctx context.Context) (resultErr error) {
 }
 
 func cloneCredentialState(state CredentialState) CredentialState {
-	return state
+	cloned := state
+	if len(state.Targets) > 0 {
+		cloned.Targets = maps.Clone(state.Targets)
+	}
+	return cloned
 }

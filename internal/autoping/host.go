@@ -172,12 +172,14 @@ func (c *HTTPStreamChunk) UnmarshalJSON(data []byte) error {
 }
 
 type ModelExecuteRequest struct {
-	EntryProtocol string      `json:"entry_protocol"`
-	ExitProtocol  string      `json:"exit_protocol"`
-	Model         string      `json:"model"`
-	Stream        bool        `json:"stream"`
-	Body          []byte      `json:"body"`
-	Headers       http.Header `json:"headers,omitempty"`
+	EntryProtocol  string      `json:"entry_protocol"`
+	ExitProtocol   string      `json:"exit_protocol"`
+	Model          string      `json:"model"`
+	Stream         bool        `json:"stream"`
+	Body           []byte      `json:"body"`
+	Headers        http.Header `json:"headers,omitempty"`
+	ForcedProvider string      `json:"forced_provider,omitempty"`
+	AuthID         string      `json:"auth_id,omitempty"`
 }
 
 type ModelExecuteResponse struct {

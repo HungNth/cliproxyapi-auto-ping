@@ -2,6 +2,7 @@ package autoping
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -118,8 +119,25 @@ func (r *Runtime) Configure(ctx context.Context, cfg Config) error {
 	if r.shutdown {
 		return errors.New("runtime is shut down")
 	}
+	marginChanged := r.config.AntigravityResetMargin != 0 && r.config.AntigravityResetMargin != cfg.AntigravityResetMargin
 	r.config = cfg
 	r.store = store
+	if marginChanged {
+		for _, cred := range store.Accounts() {
+			if cred.Provider == ProviderAntigravity && len(cred.Targets) > 0 {
+				if err := store.Update(ctx, cred.CredentialID, func(current *CredentialState) {
+					for k, tgt := range current.Targets {
+						if tgt.Status == "waiting" && !tgt.ObservedResetAt.IsZero() {
+							tgt.TargetTriggerAt = tgt.ObservedResetAt.Add(cfg.AntigravityResetMargin)
+							current.Targets[k] = tgt
+						}
+					}
+				}); err != nil {
+					return fmt.Errorf("recalculate Antigravity margins: %w", err)
+				}
+			}
+		}
+	}
 	if cfg.AutoPingEnabled {
 		scannerCtx, cancel := context.WithCancel(context.Background())
 		r.scannerCancel = cancel
@@ -199,6 +217,11 @@ func isCodex(file AuthFile) bool {
 	return provider == "codex" || strings.Contains(provider, "codex")
 }
 
+func isAntigravity(file AuthFile) bool {
+	provider := strings.ToLower(firstNonBlank(file.Provider, file.Type))
+	return provider == "antigravity" || strings.Contains(provider, "antigravity")
+}
+
 func ineligibleReason(cfg Config, file AuthFile) string {
 	switch {
 	case cfg.Excludes(file.CredentialID()):
@@ -245,7 +268,7 @@ func (r *Runtime) ManualPing(ctx context.Context, request ManualPingRequest) (Ma
 		return ManualPingResponse{}, err
 	}
 	file, found := findCredential(files, strings.TrimSpace(request.CredentialID))
-	if !found || !isCodex(file) {
+	if !found || (!isCodex(file) && !isAntigravity(file)) {
 		return ManualPingResponse{}, errors.New("Codex credential not found")
 	}
 	credentialID := file.CredentialID()
@@ -261,6 +284,9 @@ func (r *Runtime) ManualPing(ctx context.Context, request ManualPingRequest) (Ma
 		close(done)
 	}()
 
+	if isAntigravity(file) {
+		return r.manualPingAntigravity(ctx, cfg, store, file, request)
+	}
 	_, material, err := r.credentialMaterial(ctx, file)
 	if err != nil {
 		return ManualPingResponse{}, err
@@ -340,6 +366,359 @@ func (r *Runtime) ManualPing(ctx context.Context, request ManualPingRequest) (Ma
 	}
 	return ManualPingResponse{Success: true, CredentialID: credentialID, Model: result.Model, Transport: result.Transport}, nil
 }
+func (r *Runtime) manualPingAntigravity(ctx context.Context, cfg Config, store *StateStore, file AuthFile, request ManualPingRequest) (ManualPingResponse, error) {
+	credentialID := file.CredentialID()
+	var targetsToRun []struct {
+		model  string
+		key    string
+		family string
+	}
+
+	modelInput := strings.TrimSpace(request.Model)
+	if modelInput != "" {
+		switch modelInput {
+		case AntigravityModelGemini:
+			targetsToRun = append(targetsToRun, struct {
+				model  string
+				key    string
+				family string
+			}{AntigravityModelGemini, TargetKeyGemini5h, "gemini"})
+		case AntigravityModelClaude:
+			targetsToRun = append(targetsToRun, struct {
+				model  string
+				key    string
+				family string
+			}{AntigravityModelClaude, TargetKeyClaude5h, "claude"})
+		default:
+			return ManualPingResponse{
+				Success:      false,
+				CredentialID: credentialID,
+				Model:        modelInput,
+				Error:        fmt.Sprintf("unsupported Antigravity model: %s, want %s or %s", modelInput, AntigravityModelGemini, AntigravityModelClaude),
+			}, fmt.Errorf("unsupported Antigravity model: %s, want %s or %s", modelInput, AntigravityModelGemini, AntigravityModelClaude)
+		}
+	} else {
+		targetsToRun = append(targetsToRun,
+			struct {
+				model  string
+				key    string
+				family string
+			}{AntigravityModelGemini, TargetKeyGemini5h, "gemini"},
+			struct {
+				model  string
+				key    string
+				family string
+			}{AntigravityModelClaude, TargetKeyClaude5h, "claude"},
+		)
+	}
+
+	results := make([]ManualPingTargetResult, 0, len(targetsToRun))
+	hasSuccess := false
+	hasFailure := false
+	var firstError string
+
+	for _, target := range targetsToRun {
+		completedAt := r.now().UTC()
+		body, err := json.Marshal(map[string]any{
+			"model": target.model,
+			"input": cfg.Prompt,
+			"store": false,
+		})
+		if err != nil {
+			msg := safeErrorMessage(err.Error())
+			results = append(results, ManualPingTargetResult{
+				Target:      target.key,
+				ModelFamily: target.family,
+				Model:       target.model,
+				Success:     false,
+				Transport:   TransportHostModel,
+				Error:       msg,
+			})
+			hasFailure = true
+			if firstError == "" {
+				firstError = msg
+			}
+			continue
+		}
+
+		requestCtx, cancel := context.WithTimeoutCause(ctx, cfg.RequestTimeout, errors.New("Antigravity request timeout"))
+		resp, execErr := r.host.ModelExecute(requestCtx, ModelExecuteRequest{
+			EntryProtocol:  "openai-response",
+			ExitProtocol:   "openai-response",
+			Model:          target.model,
+			Stream:         false,
+			Body:           body,
+			ForcedProvider: ProviderAntigravity,
+			AuthID:         credentialID,
+		})
+		var success bool
+		var failure FailureKind
+		var message string
+		if execErr != nil {
+			failure = FailureTransport
+			if errors.Is(execErr, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+				failure = FailureTimeout
+			}
+			message = execErr.Error()
+		} else {
+			success, failure, message = evaluateAntigravityResponse(resp.StatusCode, resp.Body)
+		}
+		cancel()
+		completedAt = r.now().UTC()
+		sanitizedErr := safeErrorMessage(message)
+
+		retryDelay := cfg.RetryCooldown
+		if resp.Headers != nil {
+			if parsedDelay := parseRetryAfter(resp.Headers.Get("Retry-After"), r.now()); parsedDelay != nil {
+				retryDelay = *parsedDelay
+			}
+		}
+
+		if failure == FailureAuth {
+			hasFailure = true
+			if firstError == "" {
+				firstError = sanitizedErr
+			}
+			persistErr := store.Update(ctx, credentialID, func(current *CredentialState) {
+				current.Provider = ProviderAntigravity
+				current.Status = "blocked"
+				current.FailureKind = string(FailureAuth)
+				current.LastError = sanitizedErr
+				current.LastAttemptAt = completedAt
+				current.Failures++
+				if current.Targets == nil {
+					current.Targets = make(map[string]TargetState)
+				}
+				for _, tInfo := range targetsToRun {
+					tgt := current.Targets[tInfo.key]
+					tgt.Target = tInfo.key
+					tgt.ModelFamily = tInfo.family
+					tgt.SelectedModel = tInfo.model
+					tgt.Transport = TransportHostModel
+					tgt.Status = "blocked"
+					tgt.FailureKind = string(FailureAuth)
+					tgt.LastError = sanitizedErr
+					tgt.LastAttemptAt = completedAt
+					tgt.Failures++
+					current.Targets[tInfo.key] = tgt
+				}
+			})
+			results = append(results, ManualPingTargetResult{
+				Target:      target.key,
+				ModelFamily: target.family,
+				Model:       target.model,
+				Success:     false,
+				Transport:   TransportHostModel,
+				Error:       sanitizedErr,
+			})
+			if persistErr != nil {
+				errMsg := fmt.Sprintf("persist manual ping state: %v", persistErr)
+				return ManualPingResponse{
+					Success:      false,
+					CredentialID: credentialID,
+					Model:        request.Model,
+					Transport:    TransportHostModel,
+					Error:        errMsg,
+					Results:      results,
+				}, errors.New(errMsg)
+			}
+			break
+		}
+
+		if success {
+			hasSuccess = true
+		} else {
+			hasFailure = true
+			if firstError == "" {
+				firstError = sanitizedErr
+			}
+		}
+
+		persistErr := store.Update(ctx, credentialID, func(current *CredentialState) {
+			current.Provider = ProviderAntigravity
+			if current.Targets == nil {
+				current.Targets = make(map[string]TargetState)
+			}
+			tgt := current.Targets[target.key]
+			tgt.Target = target.key
+			tgt.ModelFamily = target.family
+			tgt.SelectedModel = target.model
+			tgt.Transport = TransportHostModel
+			tgt.LastAttemptAt = completedAt
+			tgt.Attempts++
+			if success {
+				tgt.LastAttemptStatus = "success"
+				tgt.LastPingAt = completedAt
+				tgt.LastError = ""
+				tgt.FailureKind = ""
+				tgt.Successes++
+			} else {
+				tgt.LastAttemptStatus = "failed"
+				tgt.LastError = sanitizedErr
+				tgt.FailureKind = string(failure)
+				tgt.Failures++
+				tgt.NextRetryAt = r.now().Add(retryDelay)
+			}
+			current.Targets[target.key] = tgt
+		})
+		if persistErr != nil {
+			errMsg := fmt.Sprintf("persist manual ping state: %v", persistErr)
+			results = append(results, ManualPingTargetResult{
+				Target:      target.key,
+				ModelFamily: target.family,
+				Model:       target.model,
+				Success:     false,
+				Transport:   TransportHostModel,
+				Error:       errMsg,
+			})
+			return ManualPingResponse{
+				Success:      false,
+				CredentialID: credentialID,
+				Model:        request.Model,
+				Transport:    TransportHostModel,
+				Error:        errMsg,
+				Results:      results,
+			}, errors.New(errMsg)
+		}
+		results = append(results, ManualPingTargetResult{
+			Target:      target.key,
+			ModelFamily: target.family,
+			Model:       target.model,
+			Success:     success,
+			Transport:   TransportHostModel,
+			Error:       sanitizedErr,
+		})
+	}
+
+	if request.MarkCycleProcessed && hasSuccess {
+		obs, anchorFailure, anchorMessage, qRetryAfter := r.fetchAntigravityQuotaObservation(ctx, cfg, file)
+		anchorErr := make(map[string]string)
+		anchorFailureKind := make(map[string]FailureKind)
+		anchorResets := make(map[string]time.Time)
+
+		if anchorFailure == FailureAuth {
+			_ = store.Update(ctx, credentialID, func(current *CredentialState) {
+				current.Provider = ProviderAntigravity
+				current.Status = "blocked"
+				current.FailureKind = string(FailureAuth)
+				current.LastError = safeErrorMessage(anchorMessage)
+				current.LastAttemptAt = r.now().UTC()
+				current.Failures++
+				for _, res := range results {
+					tgt := current.Targets[res.Target]
+					tgt.Status = "blocked"
+					tgt.FailureKind = string(FailureAuth)
+					tgt.LastError = safeErrorMessage(anchorMessage)
+					current.Targets[res.Target] = tgt
+				}
+			})
+		}
+
+		for _, res := range results {
+			if !res.Success {
+				continue
+			}
+			if anchorFailure != FailureNone {
+				anchorErr[res.Target] = anchorMessage
+				anchorFailureKind[res.Target] = anchorFailure
+			} else {
+				reset, ok := obs.ResetForTarget(res.Target)
+				if !ok {
+					anchorErr[res.Target] = fmt.Sprintf("no 5-hour quota bucket returned for %s", res.Target)
+					anchorFailureKind[res.Target] = FailureRetryable
+				} else if !reset.After(r.now().UTC()) {
+					anchorErr[res.Target] = "quota reset_at is not in the future of completed manual ping"
+					anchorFailureKind[res.Target] = FailureRetryable
+				} else {
+					anchorResets[res.Target] = reset
+				}
+			}
+		}
+
+		qDelay := cfg.RetryCooldown
+		if qRetryAfter != nil {
+			qDelay = *qRetryAfter
+		}
+
+		persistErr := store.Update(ctx, credentialID, func(current *CredentialState) {
+			current.Provider = ProviderAntigravity
+			if current.Targets == nil {
+				current.Targets = make(map[string]TargetState)
+			}
+			for _, res := range results {
+				if !res.Success {
+					continue
+				}
+				tgt := current.Targets[res.Target]
+				if errStr, hasErr := anchorErr[res.Target]; hasErr {
+					tgt.Status = "stabilizing"
+					tgt.Reason = "usage_stabilization_retry"
+					tgt.TargetTriggerAt = time.Time{}
+					tgt.FailureKind = string(anchorFailureKind[res.Target])
+					tgt.LastError = safeErrorMessage(errStr)
+					tgt.NextRetryAt = r.now().Add(qDelay)
+				} else {
+					tgt.Status = "waiting"
+					tgt.Reason = "trigger_scheduled"
+					tgt.ObservedResetAt = anchorResets[res.Target]
+					tgt.TargetTriggerAt = anchorResets[res.Target].Add(cfg.AntigravityResetMargin)
+					tgt.FailureKind = ""
+					tgt.LastError = ""
+					tgt.NextRetryAt = time.Time{}
+				}
+				current.Targets[res.Target] = tgt
+			}
+		})
+		if persistErr != nil {
+			errMsg := fmt.Sprintf("persist marked manual ping state: %v", persistErr)
+			return ManualPingResponse{
+				Success:      false,
+				CredentialID: credentialID,
+				Model:        request.Model,
+				Transport:    TransportHostModel,
+				Error:        errMsg,
+				Results:      results,
+			}, errors.New(errMsg)
+		}
+
+		for targetKey, errStr := range anchorErr {
+			hasFailure = true
+			msg := "manual ping succeeded but quota anchor failed: " + errStr
+			if firstError == "" {
+				firstError = msg
+			}
+			for i := range results {
+				if results[i].Target == targetKey {
+					results[i].Success = false
+					results[i].Error = msg
+				}
+			}
+		}
+	}
+
+	overallSuccess := hasSuccess && !hasFailure
+	output := ManualPingResponse{
+		Success:      overallSuccess,
+		CredentialID: credentialID,
+		Model:        request.Model,
+		Transport:    TransportHostModel,
+		Results:      results,
+	}
+	if !overallSuccess {
+		output.Error = firstError
+		return output, errors.New(firstError)
+	}
+	return output, nil
+}
+
+type ManualPingTargetResult struct {
+	Target      string `json:"target,omitempty"`
+	ModelFamily string `json:"model_family,omitempty"`
+	Model       string `json:"model,omitempty"`
+	Success     bool   `json:"success"`
+	Transport   string `json:"transport,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
 
 type ManualPingRequest struct {
 	CredentialID       string `json:"credential_id"`
@@ -348,9 +727,10 @@ type ManualPingRequest struct {
 }
 
 type ManualPingResponse struct {
-	Success      bool   `json:"success"`
-	CredentialID string `json:"credential_id"`
-	Model        string `json:"model,omitempty"`
-	Transport    string `json:"transport,omitempty"`
-	Error        string `json:"error,omitempty"`
+	Success      bool                     `json:"success"`
+	CredentialID string                   `json:"credential_id"`
+	Model        string                   `json:"model,omitempty"`
+	Transport    string                   `json:"transport,omitempty"`
+	Error        string                   `json:"error,omitempty"`
+	Results      []ManualPingTargetResult `json:"results,omitempty"`
 }

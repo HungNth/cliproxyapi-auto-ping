@@ -101,6 +101,7 @@ type statusConfig struct {
 	Transport               string   `json:"transport"`
 	SchedulerBoostFallback  bool     `json:"scheduler_boost_fallback"`
 	ExcludedCredentialCount int      `json:"excluded_credential_count"`
+	AntigravityResetMargin  string   `json:"antigravity_reset_margin,omitempty"`
 }
 
 type diagnosticsPayload struct {
@@ -281,8 +282,10 @@ func (r *Runtime) handleManagement(ctx context.Context, raw []byte) (managementR
 				"host.model.execute", "host.log",
 			},
 			Notes: []string{
-				"Dynamic scheduling observes https://chatgpt.com/backend-api/wham/usage for each eligible credential.",
-				"Each account reports observed_reset_at, target_trigger_at, status, reason, and failure_kind in the embedded status payload.",
+				"Dynamic scheduling observes https://chatgpt.com/backend-api/wham/usage for Codex and https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary for Antigravity credentials.",
+				"Antigravity auto-ping requires CLIProxyAPI v7.3.3 or newer for exact credential pinning via forced_provider=antigravity and auth_id.",
+				"Antigravity auto-ping is a reset-aligned keepalive and does not increase, bypass, or extend upstream quota.",
+				"Each account reports observed_reset_at, target_trigger_at, status, reason, failure_kind, and nested targets in the embedded status payload.",
 				"Auto-ping never logs or persists credential secrets.",
 				"Exactly-once delivery is impossible without upstream idempotency; rare crash duplicates are accepted.",
 			},
@@ -299,10 +302,26 @@ func (r *Runtime) handleManagement(ctx context.Context, raw []byte) (managementR
 			switch {
 			case strings.Contains(message, "not found"):
 				status = http.StatusNotFound
+			case strings.Contains(message, "unsupported Antigravity model"):
+				status = http.StatusBadRequest
 			case strings.Contains(message, "not eligible"), strings.Contains(message, "not ready"):
 				status = http.StatusConflict
 			case strings.Contains(message, "in-flight"):
 				status = http.StatusConflict
+			}
+			if len(output.Results) > 1 {
+				hasSuccess := false
+				hasFailure := false
+				for _, res := range output.Results {
+					if res.Success {
+						hasSuccess = true
+					} else {
+						hasFailure = true
+					}
+				}
+				if hasSuccess && hasFailure {
+					status = 207
+				}
 			}
 			output.Error = safeErrorMessage(message)
 			return jsonManagement(status, output), nil
@@ -343,6 +362,7 @@ func (r *Runtime) status() statusPayload {
 			Transport:               cfg.Transport,
 			SchedulerBoostFallback:  cfg.SchedulerBoostFallback,
 			ExcludedCredentialCount: len(cfg.ExcludeCredentials),
+			AntigravityResetMargin:  cfg.AntigravityResetMargin.String(),
 		},
 		Accounts: accounts,
 	}

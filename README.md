@@ -1,8 +1,8 @@
-# CLIProxyAPI Codex 5h Auto-Ping
+# CLIProxyAPI Auto-Ping
 
-A native [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that observes each Codex credential's five-hour quota boundary and sends one minimal targeted request after that boundary.
+A native [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that observes each Codex and Google Antigravity credential's five-hour quota boundary and sends minimal targeted requests after that boundary.
 
-> Auto-Ping consumes a small amount of real Codex quota. It does not increase, reset, bypass, or create quota and does not change OpenAI subscription or rate-limit policy.
+> Auto-Ping consumes a small amount of real quota. It does not increase, reset, bypass, or create quota and does not change OpenAI or Google subscription or rate-limit policy.
 
 ## Behavior
 
@@ -18,6 +18,22 @@ Recoverable usage or inference failures retry after `retry_cooldown`. Authentica
 
 The private usage endpoint can fail, return stale data, or change shape. A stale post-ping observation keeps the credential in stabilization and retries observation without sending another inference request.
 
+
+### Google Antigravity Behavior
+
+For every eligible Antigravity credential, the plugin maintains two independent Auto-Ping Targets:
+
+- `gemini-3.8-flash-high` for the Gemini five-hour Quota Window;
+- `claude-sonnet-4-6` for the Claude/GPT five-hour Quota Window.
+
+Weekly quota buckets are observed only as part of upstream payload data and never trigger Auto-Ping.
+
+1. Unanchored targets wait until the first configured daily milestone (`05:00` by default); startup after that milestone performs Schedule Catch-Up immediately.
+2. Activation requires **CLIProxyAPI v7.3.3 or newer** and invokes `host.model.execute` pinned to the exact credential (`auth_id: <id>`) and forced to the provider (`forced_provider: antigravity`).
+3. Following successful execution, the plugin re-reads the host auth document, resolves project identity (falling back to `loadCodeAssist` if needed), and queries `POST /v1internal:retrieveUserQuotaSummary`.
+4. Targets anchor independently at `resetTime + antigravity_reset_margin` (`30s` by default). Healthy anchored Antigravity targets ignore subsequent daily milestones and run only when their observed reset boundary arrives.
+5. Stale, missing, or non-future quota observations place the target into `stabilizing` to retry observation without sending duplicate inference pings.
+6. Model or business failures are target-local; credential authentication failures (HTTP 401/403) block the credential and skip sibling targets until the next daily schedule milestone.
 The plugins are independent and may be enabled together. This plugin does not modify `quota-activation` behavior or state.
 
 ## Configuration
@@ -60,8 +76,10 @@ plugins:
 
             # Empty means every otherwise eligible Codex credential.
             exclude_credentials: []
-
             state_path: "cliproxyapi-auto-ping/state.json"
+
+            # Delay added after an Antigravity quota reset before triggering an Auto-Ping.
+            antigravity_reset_margin: "30s"
 ```
 
 An explicit model disables model fallback:
@@ -87,13 +105,12 @@ An `auto_ping_disabled: true` you wrote yourself is preserved: re-enabling the p
 | `transport`                | `direct_http`                      | Guarantees the intended credential is used                 |
 | `scheduler_boost_fallback` | `true`                             | Fallback only for host/transport failures                  |
 | `state_path`               | `cliproxyapi-auto-ping/state.json` | Persistent state location                                  |
-
+| `antigravity_reset_margin` | `30s`                              | Offset added to Antigravity resetTime before triggering ping |
 > **Upgrade notice (State Schema v3):** Existing version 1 and version 2 state files are rejected with an actionable startup/configuration error. Remove the old `state.json` file or select a new `state_path` before enabling this release.
 
 ## Eligibility and failure handling
 
-The scheduler skips disabled, revoked, explicitly excluded, and non-Codex credentials. The host's temporary `unavailable` flag alone does not exclude a credential.
-
+The scheduler skips disabled, revoked, and explicitly excluded credentials, as well as credentials from unsupported providers. The host's temporary `unavailable` flag alone does not exclude a credential.
 - Credential material, transport, timeout, HTTP 429, or upstream 5xx failure: retry usage observation or inference after `retry_cooldown`.
 - Invalid authentication, model failure, business rejection, missing five-hour window, or invalid usage payload: terminal for the current cycle; retry fresh at the next configured schedule anchor.
 - Unsupported auto-selected model: try the next configured candidate once.
@@ -124,9 +141,18 @@ Manual ping body:
 }
 ```
 
-Manual pings do not advance the dynamic cycle unless `mark_cycle_processed` is true. When true, a successful manual ping re-observes `/wham/usage` and anchors the next dynamic cycle at `reset_at + 30s` only after upstream reset strictly advances. If usage observation fails or returns a stale reset, the account transitions to `stabilizing` and retries observation without duplicating inference.
+For Antigravity credentials, an omitted `model` executes both fixed targets (`gemini-3.8-flash-high` and `claude-sonnet-4-6`), while a specified model runs only that target:
 
-Status and diagnostics expose credential IDs, `observed_reset_at`, `target_trigger_at`, `last_processed_reset_at`, decisions, counters, selected model, transport, retry timing, and sanitized errors. Access tokens, refresh tokens, authorization headers, cookies, and raw credential JSON are never persisted or returned.
+```json
+{
+    "credential_id": "antigravity-account-a",
+    "mark_cycle_processed": true
+}
+```
+
+Manual responses return HTTP 200 on all-success, HTTP 207 Multi-Status when target outcomes are mixed, and HTTP 502 when all targets fail, with each target reported in the `results` array.
+
+Manual pings do not advance dynamic cycles unless `mark_cycle_processed` is true. When true, successful Codex pings advance upon strictly advanced reset observations, and successful Antigravity targets anchor to their respective future five-hour resets plus margin. Stale observations transition to `stabilizing` without duplicate inference.
 
 ## Build
 

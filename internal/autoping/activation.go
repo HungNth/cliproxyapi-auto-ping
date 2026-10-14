@@ -272,6 +272,58 @@ func evaluateCodexResponse(statusCode int, body []byte) (bool, FailureKind, stri
 	return false, FailureBusiness, "Codex response lacked a success event"
 }
 
+func formatAntigravityHTTPErrorMessage(statusCode int, body []byte) string {
+	if detail := extractErrorDetail(body); detail != "" {
+		return fmt.Sprintf("Antigravity returned HTTP %d: %s", statusCode, detail)
+	}
+	return fmt.Sprintf("Antigravity returned HTTP %d", statusCode)
+}
+
+func evaluateAntigravityResponse(statusCode int, body []byte) (bool, FailureKind, string) {
+	switch {
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		if detail := extractErrorDetail(body); detail != "" {
+			return false, FailureAuth, fmt.Sprintf("credential authentication failed: %s", detail)
+		}
+		return false, FailureAuth, "credential authentication failed"
+	case statusCode < 200 || statusCode >= 300:
+		message := formatAntigravityHTTPErrorMessage(statusCode, body)
+		switch {
+		case statusCode == http.StatusBadRequest || statusCode == http.StatusNotFound || isModelFailure(body):
+			return false, FailureModel, message
+		case statusCode == http.StatusTooManyRequests || statusCode >= 500:
+			return false, FailureRetryable, message
+		default:
+			return false, FailureBusiness, message
+		}
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return false, FailureBusiness, "Antigravity response was empty"
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
+		return false, FailureBusiness, "Antigravity response was invalid"
+	}
+	if failure, message := antigravityFailure(root); failure != FailureNone {
+		return false, failure, message
+	}
+	return true, FailureNone, ""
+}
+
+func antigravityFailure(root map[string]json.RawMessage) (FailureKind, string) {
+	if raw, ok := root["error"]; ok {
+		var errObj map[string]any
+		if err := json.Unmarshal(raw, &errObj); err == nil {
+			if msg, ok := errObj["message"].(string); ok && strings.TrimSpace(msg) != "" {
+				return FailureBusiness, safeErrorMessage(strings.TrimSpace(msg))
+			}
+		}
+		return FailureBusiness, safeErrorMessage(string(raw))
+	}
+	return FailureNone, ""
+}
+
 func evaluateCodexSSE(stream string) (bool, FailureKind, string) {
 	sawCompleted := false
 	sawCreated := false

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8] - 2026-10-14
+
+### Added
+
+- Google Antigravity reset-aligned Auto-Ping support for Gemini (`gemini-3.8-flash-high`) and Claude/GPT (`claude-sonnet-4-6`) five-hour Quota Windows.
+- Exact host-pinned model execution via `host.model.execute` with `forced_provider: antigravity` and `auth_id`, requiring CLIProxyAPI v7.3.3 or newer.
+- Antigravity quota observation via `POST /v1internal:retrieveUserQuotaSummary` with fallback `POST /v1internal:loadCodeAssist` project discovery.
+- Configurable `antigravity_reset_margin` setting (default `30s`) with dynamic trigger recalculation on reconfiguration.
+- Two-target manual `/ping` execution supporting omitted model, partial results reporting (HTTP 200, 207, 502), and nested target state in status and diagnostics.
+
 ## [0.2.7] - 2026-09-24
 
 ### Fixed

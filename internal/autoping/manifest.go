@@ -61,6 +61,7 @@ var manifestFieldTypes = map[string]string{
 	"scheduler_boost_fallback": "boolean",
 	"exclude_credentials":      "array",
 	"state_path":               "string",
+	"antigravity_reset_margin": "string",
 }
 
 // ParseManifest strictly decodes and validates a Plugin Manifest document.

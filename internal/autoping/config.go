@@ -36,6 +36,7 @@ type Config struct {
 	SchedulerBoostFallback bool
 	ExcludeCredentials     []string
 	StatePath              string
+	AntigravityResetMargin time.Duration
 }
 
 type rawConfig struct {
@@ -52,6 +53,7 @@ type rawConfig struct {
 	SchedulerBoostFallback *bool    `yaml:"scheduler_boost_fallback"`
 	ExcludeCredentials     []string `yaml:"exclude_credentials"`
 	StatePath              *string  `yaml:"state_path"`
+	AntigravityResetMargin string   `yaml:"antigravity_reset_margin"`
 }
 
 func configFromRaw(raw rawConfig, base Config, requireComplete bool) (Config, error) {
@@ -156,6 +158,15 @@ func configFromRaw(raw rawConfig, base Config, requireComplete bool) (Config, er
 	if cfg.StatePath == "" {
 		return Config{}, fmt.Errorf("%w: state_path must not be empty", ErrInvalidConfig)
 	}
+	if raw.AntigravityResetMargin != "" {
+		parsed, err := nonNegativeDuration("antigravity_reset_margin", raw.AntigravityResetMargin)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.AntigravityResetMargin = parsed
+	} else if requireComplete {
+		return Config{}, fmt.Errorf("%w: manifest defaults must set antigravity_reset_margin", ErrInvalidConfig)
+	}
 	return cfg, nil
 }
 
@@ -210,6 +221,8 @@ func (c Config) fieldValue(name string) any {
 		return slices.Clone(c.ExcludeCredentials)
 	case "state_path":
 		return c.StatePath
+	case "antigravity_reset_margin":
+		return c.AntigravityResetMargin.String()
 	}
 	return nil
 }

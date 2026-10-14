@@ -2,6 +2,7 @@ package autoping
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -37,7 +38,7 @@ func (r *Runtime) runDynamicSchedule(ctx context.Context) {
 
 		eligible := make([]AuthFile, 0, len(files))
 		for _, file := range files {
-			if file.CredentialID() != "" && isCodex(file) && ineligibleReason(cfg, file) == "" {
+			if file.CredentialID() != "" && (isCodex(file) || isAntigravity(file)) && ineligibleReason(cfg, file) == "" {
 				eligible = append(eligible, file)
 			}
 		}
@@ -56,6 +57,17 @@ func (r *Runtime) runDynamicSchedule(ctx context.Context) {
 		for _, file := range eligible {
 			credID := file.CredentialID()
 			state := store.Credential(credID)
+			if isAntigravity(file) {
+				due, dueErr := r.isAntigravityDue(ctx, now, initialAnchor, beforeInitialAnchor, cfg, store, file)
+				if dueErr != nil {
+					r.log(ctx, "error", "dynamic schedule stopped", map[string]any{"error": safeErrorMessage(dueErr.Error())})
+					return
+				}
+				if due {
+					dueJobs = append(dueJobs, file)
+				}
+				continue
+			}
 
 			// Terminal failures end only the current configured milestone cycle.
 			if terminalDynamicFailure(FailureKind(state.FailureKind)) {
@@ -120,6 +132,10 @@ func (r *Runtime) runDynamicSchedule(ctx context.Context) {
 		var nextEarliestWake time.Time
 
 		for _, file := range eligible {
+			if isAntigravity(file) {
+				r.calculateAntigravityWake(nowAfter, initialAnchor, beforeInitialAnchor, cfg, store, file, &nextEarliestWake)
+				continue
+			}
 			state := store.Credential(file.CredentialID())
 			if terminalDynamicFailure(FailureKind(state.FailureKind)) {
 				nextAnchor, _ := NextMilestone(state.LastAttemptAt, cfg.Schedule, cfg.Location)
@@ -263,6 +279,9 @@ func (r *Runtime) runDynamicJob(ctx context.Context, cfg Config, store *StateSto
 	}
 	if !state.NextRetryAt.IsZero() && state.NextRetryAt.After(now) {
 		return nil
+	}
+	if isAntigravity(file) {
+		return r.runDynamicAntigravityJob(ctx, cfg, store, file)
 	}
 	initialAnchor := firstDailyAnchor(now, cfg.Schedule, cfg.Location)
 	isMandatoryDailyAnchor := !now.Before(initialAnchor) && (state.LastPingAt.IsZero() || state.LastPingAt.Before(initialAnchor))
@@ -476,3 +495,591 @@ func nextTargetAfterPing(completedAt, resetAt time.Time, schedule []string, loc 
 	return dynamicTrigger
 }
 
+func (r *Runtime) isAntigravityDue(ctx context.Context, now, initialAnchor time.Time, beforeInitialAnchor bool, cfg Config, store *StateStore, file AuthFile) (bool, error) {
+	credID := file.CredentialID()
+	state := store.Credential(credID)
+
+	if terminalDynamicFailure(FailureKind(state.FailureKind)) {
+		nextAnchor, _ := NextMilestone(state.LastAttemptAt, cfg.Schedule, cfg.Location)
+		if now.Before(nextAnchor) {
+			return false, nil
+		}
+		if err := store.Update(ctx, credID, func(current *CredentialState) {
+			current.FailureKind = ""
+			current.Status = "waiting"
+			current.Reason = "cycle_reset"
+			for k, tgt := range current.Targets {
+				tgt.FailureKind = ""
+				tgt.Status = "waiting"
+				tgt.Reason = "cycle_reset"
+				current.Targets[k] = tgt
+			}
+		}); err != nil {
+			return false, fmt.Errorf("reset Antigravity cycle: %w", err)
+		}
+		state = store.Credential(credID)
+	}
+	if !state.NextRetryAt.IsZero() && state.NextRetryAt.After(now) {
+		return false, nil
+	}
+
+	hasDueTarget := false
+	for _, key := range []string{TargetKeyGemini5h, TargetKeyClaude5h} {
+		tgt, ok := state.Targets[key]
+		if ok && terminalDynamicFailure(FailureKind(tgt.FailureKind)) {
+			nextAnchor, _ := NextMilestone(tgt.LastAttemptAt, cfg.Schedule, cfg.Location)
+			if !now.Before(nextAnchor) {
+				if err := store.Update(ctx, credID, func(current *CredentialState) {
+					curTgt := current.Targets[key]
+					curTgt.FailureKind = ""
+					curTgt.Status = "waiting"
+					curTgt.Reason = "cycle_reset"
+					current.Targets[key] = curTgt
+				}); err != nil {
+					return false, fmt.Errorf("reset Antigravity target cycle: %w", err)
+				}
+				tgt = store.Credential(credID).Targets[key]
+			}
+		}
+
+		if !ok || (tgt.TargetTriggerAt.IsZero() && tgt.Status != "stabilizing" && tgt.FailureKind == "") {
+			if !beforeInitialAnchor {
+				hasDueTarget = true
+			}
+		} else if tgt.Status == "stabilizing" {
+			if tgt.NextRetryAt.IsZero() || !tgt.NextRetryAt.After(now) {
+				hasDueTarget = true
+			}
+		} else if !tgt.TargetTriggerAt.IsZero() && !now.Before(tgt.TargetTriggerAt) {
+			hasDueTarget = true
+		}
+	}
+	return hasDueTarget, nil
+}
+
+func (r *Runtime) calculateAntigravityWake(nowAfter, initialAnchor time.Time, beforeInitialAnchor bool, cfg Config, store *StateStore, file AuthFile, nextEarliestWake *time.Time) {
+	state := store.Credential(file.CredentialID())
+	if terminalDynamicFailure(FailureKind(state.FailureKind)) {
+		nextAnchor, _ := NextMilestone(state.LastAttemptAt, cfg.Schedule, cfg.Location)
+		target := nextAnchor
+		if target.Before(nowAfter) {
+			target = nowAfter
+		}
+		if nextEarliestWake.IsZero() || target.Before(*nextEarliestWake) {
+			*nextEarliestWake = target
+		}
+		return
+	}
+	if !state.NextRetryAt.IsZero() {
+		target := state.NextRetryAt
+		if target.Before(nowAfter) {
+			target = nowAfter
+		}
+		if nextEarliestWake.IsZero() || target.Before(*nextEarliestWake) {
+			*nextEarliestWake = target
+		}
+		return
+	}
+
+	geminiTarget, hasGemini := state.Targets[TargetKeyGemini5h]
+	claudeTarget, hasClaude := state.Targets[TargetKeyClaude5h]
+	unanchored := !hasGemini || !hasClaude ||
+		(geminiTarget.TargetTriggerAt.IsZero() && geminiTarget.Status != "stabilizing" && geminiTarget.FailureKind == "") ||
+		(claudeTarget.TargetTriggerAt.IsZero() && claudeTarget.Status != "stabilizing" && claudeTarget.FailureKind == "")
+	if unanchored && beforeInitialAnchor {
+		if nextEarliestWake.IsZero() || initialAnchor.Before(*nextEarliestWake) {
+			*nextEarliestWake = initialAnchor
+		}
+	}
+
+	for _, tgt := range []TargetState{geminiTarget, claudeTarget} {
+		if terminalDynamicFailure(FailureKind(tgt.FailureKind)) {
+			nextAnchor, _ := NextMilestone(tgt.LastAttemptAt, cfg.Schedule, cfg.Location)
+			target := nextAnchor
+			if target.Before(nowAfter) {
+				target = nowAfter
+			}
+			if nextEarliestWake.IsZero() || target.Before(*nextEarliestWake) {
+				*nextEarliestWake = target
+			}
+			continue
+		}
+		if tgt.Status == "stabilizing" {
+			if tgt.NextRetryAt.IsZero() || tgt.NextRetryAt.Before(nowAfter) {
+				*nextEarliestWake = nowAfter
+			} else if nextEarliestWake.IsZero() || tgt.NextRetryAt.Before(*nextEarliestWake) {
+				*nextEarliestWake = tgt.NextRetryAt
+			}
+			continue
+		}
+		if !tgt.NextRetryAt.IsZero() {
+			target := tgt.NextRetryAt
+			if target.Before(nowAfter) {
+				target = nowAfter
+			}
+			if nextEarliestWake.IsZero() || target.Before(*nextEarliestWake) {
+				*nextEarliestWake = target
+			}
+			continue
+		}
+		if !tgt.TargetTriggerAt.IsZero() {
+			target := tgt.TargetTriggerAt
+			if target.Before(nowAfter) {
+				target = nowAfter
+			}
+			if nextEarliestWake.IsZero() || target.Before(*nextEarliestWake) {
+				*nextEarliestWake = target
+			}
+		}
+	}
+}
+
+func (r *Runtime) runDynamicAntigravityJob(ctx context.Context, cfg Config, store *StateStore, file AuthFile) error {
+	credID := file.CredentialID()
+	state := store.Credential(credID)
+	now := r.now()
+
+	if terminalDynamicFailure(FailureKind(state.FailureKind)) {
+		return nil
+	}
+	if !state.NextRetryAt.IsZero() && state.NextRetryAt.After(now) {
+		return nil
+	}
+
+	hasUnanchored := false
+	for _, key := range []string{TargetKeyGemini5h, TargetKeyClaude5h} {
+		tgt, ok := state.Targets[key]
+		if !ok || (tgt.TargetTriggerAt.IsZero() && tgt.Status != "stabilizing" && tgt.FailureKind == "") {
+			hasUnanchored = true
+			break
+		}
+	}
+
+	if hasUnanchored {
+		if err := r.bootstrapAntigravityCredential(ctx, cfg, store, file); err != nil {
+			return err
+		}
+	}
+
+	return r.executeDynamicAntigravityTargets(ctx, cfg, store, file)
+}
+
+func (r *Runtime) bootstrapAntigravityCredential(ctx context.Context, cfg Config, store *StateStore, file AuthFile) error {
+	credID := file.CredentialID()
+	targets := []struct {
+		model  string
+		key    string
+		family string
+	}{
+		{AntigravityModelGemini, TargetKeyGemini5h, "gemini"},
+		{AntigravityModelClaude, TargetKeyClaude5h, "claude"},
+	}
+
+	var successfulTargets []string
+	var authFailed bool
+
+	for _, t := range targets {
+		if authFailed {
+			break
+		}
+		currentTgt, exists := store.Credential(credID).Targets[t.key]
+		if exists && (!currentTgt.TargetTriggerAt.IsZero() || currentTgt.Status == "stabilizing" || terminalDynamicFailure(FailureKind(currentTgt.FailureKind))) {
+			continue
+		}
+
+		completedAt := r.now().UTC()
+		body, err := json.Marshal(map[string]any{
+			"model": t.model,
+			"input": cfg.Prompt,
+			"store": false,
+		})
+		if err != nil {
+			if updateErr := store.Update(ctx, credID, func(current *CredentialState) {
+				current.Provider = ProviderAntigravity
+				if current.Targets == nil {
+					current.Targets = make(map[string]TargetState)
+				}
+				tgt := current.Targets[t.key]
+				tgt.Target = t.key
+				tgt.ModelFamily = t.family
+				tgt.SelectedModel = t.model
+				tgt.Transport = TransportHostModel
+				tgt.LastAttemptStatus = "failed"
+				tgt.LastError = safeErrorMessage(err.Error())
+				tgt.FailureKind = string(FailureBusiness)
+				tgt.Failures++
+				tgt.LastAttemptAt = completedAt
+				current.Targets[t.key] = tgt
+			}); updateErr != nil {
+				return fmt.Errorf("persist bootstrap target failure: %w", updateErr)
+			}
+			continue
+		}
+
+		requestCtx, cancel := context.WithTimeoutCause(ctx, cfg.RequestTimeout, errors.New("Antigravity bootstrap timeout"))
+		resp, execErr := r.host.ModelExecute(requestCtx, ModelExecuteRequest{
+			EntryProtocol:  "openai-response",
+			ExitProtocol:   "openai-response",
+			Model:          t.model,
+			Stream:         false,
+			Body:           body,
+			ForcedProvider: ProviderAntigravity,
+			AuthID:         credID,
+		})
+		var success bool
+		var failure FailureKind
+		var message string
+		if execErr != nil {
+			failure = FailureTransport
+			if errors.Is(execErr, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+				failure = FailureTimeout
+			}
+			message = execErr.Error()
+		} else {
+			success, failure, message = evaluateAntigravityResponse(resp.StatusCode, resp.Body)
+		}
+		cancel()
+
+		completedAt = r.now().UTC()
+		sanitizedErr := safeErrorMessage(message)
+
+		if failure == FailureAuth {
+			authFailed = true
+			if updateErr := store.Update(ctx, credID, func(current *CredentialState) {
+				current.Provider = ProviderAntigravity
+				current.Status = "blocked"
+				current.FailureKind = string(FailureAuth)
+				current.LastError = sanitizedErr
+				current.LastAttemptAt = completedAt
+				current.Failures++
+				if current.Targets == nil {
+					current.Targets = make(map[string]TargetState)
+				}
+				for _, tgtInfo := range targets {
+					tgt := current.Targets[tgtInfo.key]
+					tgt.Target = tgtInfo.key
+					tgt.ModelFamily = tgtInfo.family
+					tgt.SelectedModel = tgtInfo.model
+					tgt.Transport = TransportHostModel
+					tgt.Status = "blocked"
+					tgt.FailureKind = string(FailureAuth)
+					tgt.LastError = sanitizedErr
+					tgt.LastAttemptAt = completedAt
+					tgt.Failures++
+					current.Targets[tgtInfo.key] = tgt
+				}
+			}); updateErr != nil {
+				return fmt.Errorf("persist bootstrap auth failure: %w", updateErr)
+			}
+			break
+		}
+
+		if updateErr := store.Update(ctx, credID, func(current *CredentialState) {
+			current.Provider = ProviderAntigravity
+			if current.Targets == nil {
+				current.Targets = make(map[string]TargetState)
+			}
+			tgt := current.Targets[t.key]
+			tgt.Target = t.key
+			tgt.ModelFamily = t.family
+			tgt.SelectedModel = t.model
+			tgt.Transport = TransportHostModel
+			tgt.LastAttemptAt = completedAt
+			tgt.Attempts++
+			if success {
+				tgt.LastAttemptStatus = "success"
+				tgt.LastPingAt = completedAt
+				tgt.LastError = ""
+				tgt.FailureKind = ""
+				tgt.Successes++
+				tgt.Status = "stabilizing"
+				tgt.Reason = "awaiting_new_reset"
+			} else {
+				tgt.LastAttemptStatus = "failed"
+				tgt.LastError = sanitizedErr
+				tgt.FailureKind = string(failure)
+				tgt.Failures++
+				tgt.Status = "cooldown"
+				tgt.Reason = "bootstrap_failure"
+				tgt.NextRetryAt = r.now().Add(cfg.RetryCooldown)
+			}
+			current.Targets[t.key] = tgt
+		}); updateErr != nil {
+			return fmt.Errorf("persist bootstrap target status: %w", updateErr)
+		}
+		if success {
+			successfulTargets = append(successfulTargets, t.key)
+		}
+	}
+
+	if len(successfulTargets) > 0 {
+		obs, qFail, qMsg, qRetryAfter := r.fetchAntigravityQuotaObservation(ctx, cfg, file)
+		qDelay := cfg.RetryCooldown
+		if qRetryAfter != nil {
+			qDelay = *qRetryAfter
+		}
+		if updateErr := store.Update(ctx, credID, func(current *CredentialState) {
+			current.Provider = ProviderAntigravity
+			if current.Targets == nil {
+				current.Targets = make(map[string]TargetState)
+			}
+			for _, targetKey := range successfulTargets {
+				tgt := current.Targets[targetKey]
+				if qFail != FailureNone {
+					tgt.Status = "stabilizing"
+					tgt.Reason = "usage_stabilization_retry"
+					tgt.FailureKind = string(qFail)
+					tgt.LastError = safeErrorMessage(qMsg)
+					tgt.NextRetryAt = r.now().Add(qDelay)
+				} else {
+					reset, ok := obs.ResetForTarget(targetKey)
+					if !ok || !reset.After(r.now().UTC()) {
+						tgt.Status = "stabilizing"
+						tgt.Reason = "usage_stabilization_retry"
+						tgt.FailureKind = string(FailureRetryable)
+						tgt.LastError = "quota reset_at is not in the future of completed bootstrap"
+						tgt.NextRetryAt = r.now().Add(qDelay)
+					} else {
+						tgt.ObservedResetAt = reset
+						tgt.TargetTriggerAt = reset.Add(cfg.AntigravityResetMargin)
+						tgt.Status = "waiting"
+						tgt.Reason = "trigger_scheduled"
+						tgt.FailureKind = ""
+						tgt.LastError = ""
+						tgt.NextRetryAt = time.Time{}
+					}
+				}
+				current.Targets[targetKey] = tgt
+			}
+		}); updateErr != nil {
+			return fmt.Errorf("persist bootstrap quota anchoring: %w", updateErr)
+		}
+	}
+	return nil
+}
+
+func (r *Runtime) executeDynamicAntigravityTargets(ctx context.Context, cfg Config, store *StateStore, file AuthFile) error {
+	credID := file.CredentialID()
+	now := r.now()
+	targets := []struct {
+		model  string
+		key    string
+		family string
+	}{
+		{AntigravityModelGemini, TargetKeyGemini5h, "gemini"},
+		{AntigravityModelClaude, TargetKeyClaude5h, "claude"},
+	}
+
+	for _, t := range targets {
+		state := store.Credential(credID)
+		if terminalDynamicFailure(FailureKind(state.FailureKind)) {
+			return nil
+		}
+		tgt, exists := state.Targets[t.key]
+		if !exists {
+			continue
+		}
+		if terminalDynamicFailure(FailureKind(tgt.FailureKind)) {
+			continue
+		}
+		if !tgt.NextRetryAt.IsZero() && tgt.NextRetryAt.After(now) {
+			continue
+		}
+
+		if tgt.Status == "stabilizing" {
+			obs, qFail, qMsg, qRetryAfter := r.fetchAntigravityQuotaObservation(ctx, cfg, file)
+			qDelay := cfg.RetryCooldown
+			if qRetryAfter != nil {
+				qDelay = *qRetryAfter
+			}
+			if updateErr := store.Update(ctx, credID, func(current *CredentialState) {
+				current.Provider = ProviderAntigravity
+				if current.Targets == nil {
+					current.Targets = make(map[string]TargetState)
+				}
+				curTgt := current.Targets[t.key]
+				if qFail != FailureNone {
+					curTgt.FailureKind = string(qFail)
+					curTgt.LastError = safeErrorMessage(qMsg)
+					curTgt.NextRetryAt = r.now().Add(qDelay)
+				} else {
+					reset, ok := obs.ResetForTarget(t.key)
+					if ok && reset.After(curTgt.ObservedResetAt) && reset.After(r.now().UTC()) {
+						curTgt.LastProcessedResetAt = curTgt.ObservedResetAt
+						curTgt.ObservedResetAt = reset
+						curTgt.TargetTriggerAt = reset.Add(cfg.AntigravityResetMargin)
+						curTgt.Status = "waiting"
+						curTgt.Reason = "trigger_scheduled"
+						curTgt.FailureKind = ""
+						curTgt.LastError = ""
+						curTgt.NextRetryAt = time.Time{}
+					} else {
+						curTgt.FailureKind = string(FailureRetryable)
+						curTgt.LastError = "stabilization reset_at did not advance"
+						curTgt.NextRetryAt = r.now().Add(qDelay)
+					}
+				}
+				current.Targets[t.key] = curTgt
+			}); updateErr != nil {
+				return fmt.Errorf("persist stabilizing target observation: %w", updateErr)
+			}
+			continue
+		}
+
+		if tgt.TargetTriggerAt.IsZero() || now.Before(tgt.TargetTriggerAt) {
+			continue
+		}
+
+		completedAt := r.now().UTC()
+		body, err := json.Marshal(map[string]any{
+			"model": t.model,
+			"input": cfg.Prompt,
+			"store": false,
+		})
+		if err != nil {
+			continue
+		}
+
+		if updateErr := store.Update(ctx, credID, func(current *CredentialState) {
+			current.Provider = ProviderAntigravity
+			if current.Targets == nil {
+				current.Targets = make(map[string]TargetState)
+			}
+			curTgt := current.Targets[t.key]
+			curTgt.Status = "in_flight"
+			curTgt.Reason = "dynamic_trigger"
+			curTgt.LastAttemptAt = completedAt
+			curTgt.LastAttemptStatus = "in_flight"
+			curTgt.Attempts++
+			current.Targets[t.key] = curTgt
+		}); updateErr != nil {
+			return fmt.Errorf("persist in_flight dynamic target: %w", updateErr)
+		}
+		requestCtx, cancel := context.WithTimeoutCause(ctx, cfg.RequestTimeout, errors.New("Antigravity execution timeout"))
+		resp, execErr := r.host.ModelExecute(requestCtx, ModelExecuteRequest{
+			EntryProtocol:  "openai-response",
+			ExitProtocol:   "openai-response",
+			Model:          t.model,
+			Stream:         false,
+			Body:           body,
+			ForcedProvider: ProviderAntigravity,
+			AuthID:         credID,
+		})
+		var success bool
+		var failure FailureKind
+		var message string
+		if execErr != nil {
+			failure = FailureTransport
+			if errors.Is(execErr, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+				failure = FailureTimeout
+			}
+			message = execErr.Error()
+		} else {
+			success, failure, message = evaluateAntigravityResponse(resp.StatusCode, resp.Body)
+		}
+		cancel()
+		completedAt = r.now().UTC()
+		sanitizedErr := safeErrorMessage(message)
+
+		retryDelay := cfg.RetryCooldown
+		if resp.Headers != nil {
+			if parsedDelay := parseRetryAfter(resp.Headers.Get("Retry-After"), r.now()); parsedDelay != nil {
+				retryDelay = *parsedDelay
+			}
+		}
+
+		if failure == FailureAuth {
+			if updateErr := store.Update(ctx, credID, func(current *CredentialState) {
+				current.Provider = ProviderAntigravity
+				current.Status = "blocked"
+				current.FailureKind = string(FailureAuth)
+				current.LastError = sanitizedErr
+				current.LastAttemptAt = completedAt
+				current.Failures++
+				if current.Targets == nil {
+					current.Targets = make(map[string]TargetState)
+				}
+				for _, tgtInfo := range targets {
+					tgt := current.Targets[tgtInfo.key]
+					tgt.Status = "blocked"
+					tgt.FailureKind = string(FailureAuth)
+					tgt.LastError = sanitizedErr
+					tgt.LastAttemptAt = completedAt
+					current.Targets[tgtInfo.key] = tgt
+				}
+			}); updateErr != nil {
+				return fmt.Errorf("persist dynamic auth failure: %w", updateErr)
+			}
+			return nil
+		}
+
+		if updateErr := store.Update(ctx, credID, func(current *CredentialState) {
+			current.Provider = ProviderAntigravity
+			if current.Targets == nil {
+				current.Targets = make(map[string]TargetState)
+			}
+			curTgt := current.Targets[t.key]
+			curTgt.LastAttemptAt = completedAt
+			if success {
+				curTgt.LastAttemptStatus = "success"
+				curTgt.LastPingAt = completedAt
+				curTgt.LastError = ""
+				curTgt.FailureKind = ""
+				curTgt.Successes++
+				curTgt.Status = "stabilizing"
+				curTgt.Reason = "awaiting_new_reset"
+				curTgt.TargetTriggerAt = time.Time{}
+			} else {
+				curTgt.LastAttemptStatus = "failed"
+				curTgt.LastError = sanitizedErr
+				curTgt.FailureKind = string(failure)
+				curTgt.Failures++
+				curTgt.Status = "cooldown"
+				curTgt.Reason = "execution_failure"
+				curTgt.NextRetryAt = r.now().Add(retryDelay)
+			}
+			current.Targets[t.key] = curTgt
+		}); updateErr != nil {
+			return fmt.Errorf("persist dynamic execution outcome: %w", updateErr)
+		}
+		if success {
+			obs, qFail, qMsg, qRetryAfter := r.fetchAntigravityQuotaObservation(ctx, cfg, file)
+			qDelay := cfg.RetryCooldown
+			if qRetryAfter != nil {
+				qDelay = *qRetryAfter
+			}
+			if updateErr := store.Update(ctx, credID, func(current *CredentialState) {
+				current.Provider = ProviderAntigravity
+				if current.Targets == nil {
+					current.Targets = make(map[string]TargetState)
+				}
+				curTgt := current.Targets[t.key]
+				if qFail != FailureNone {
+					curTgt.FailureKind = string(qFail)
+					curTgt.LastError = safeErrorMessage(qMsg)
+					curTgt.NextRetryAt = r.now().Add(qDelay)
+				} else {
+					reset, ok := obs.ResetForTarget(t.key)
+					if ok && reset.After(curTgt.ObservedResetAt) && reset.After(r.now().UTC()) {
+						curTgt.LastProcessedResetAt = curTgt.ObservedResetAt
+						curTgt.ObservedResetAt = reset
+						curTgt.TargetTriggerAt = reset.Add(cfg.AntigravityResetMargin)
+						curTgt.Status = "waiting"
+						curTgt.Reason = "trigger_scheduled"
+						curTgt.FailureKind = ""
+						curTgt.LastError = ""
+						curTgt.NextRetryAt = time.Time{}
+					} else {
+						curTgt.FailureKind = string(FailureRetryable)
+						curTgt.LastError = "stabilization reset_at did not advance"
+						curTgt.NextRetryAt = r.now().Add(qDelay)
+					}
+				}
+				current.Targets[t.key] = curTgt
+			}); updateErr != nil {
+				return fmt.Errorf("persist post-ping quota observation: %w", updateErr)
+			}
+		}
+	}
+	return nil
+}
