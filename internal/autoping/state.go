@@ -21,7 +21,7 @@ const (
 	ProviderAntigravity = "antigravity"
 
 	AntigravityModelGemini = "gemini-3.8-flash-high"
-	AntigravityModelClaude = "claude-sonnet-4-6"
+	AntigravityModelClaude = "claude-sonnet-5-5-high"
 
 	TargetKeyGemini5h = "gemini_5h"
 	TargetKeyClaude5h = "claude_5h"

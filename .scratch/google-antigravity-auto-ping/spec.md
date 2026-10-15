@@ -18,7 +18,7 @@ Extend the existing plugin with an isolated Antigravity provider engine under th
 For every Eligible Antigravity Credential, maintain two independent Auto-Ping Targets:
 
 - `gemini-3.8-flash-high` for the Gemini five-hour Quota Window;
-- `claude-sonnet-4-6` for the Claude/GPT five-hour Quota Window.
+- `claude-sonnet-5-5-high` for the Claude/GPT five-hour Quota Window.
 
 An unanchored target bootstraps at the first applicable Schedule Milestone or Schedule Catch-Up. Bootstrap sends the minimal inference through CLIProxyAPI's provider-aware model execution path, pinned to the exact credential and forced to the Antigravity provider. After a successful inference, the plugin re-reads the credential, obtains the selected five-hour reset from `retrieveUserQuotaSummary`, and schedules the next request at `resetTime + antigravity_reset_margin`.
 
@@ -38,7 +38,7 @@ The feature is a reset-aligned keepalive. It does not claim to increase, bypass,
 6. As a CLIProxyAPI operator, I want temporary host unavailability not to permanently remove an Antigravity Credential from eligibility, so that later Attempt Cycles can recover automatically.
 7. As an Antigravity user, I want Gemini and Claude/GPT quota behavior tracked independently, so that one Model Family cannot advance or block the other.
 8. As an Antigravity user, I want `gemini-3.8-flash-high` targeted for the Gemini five-hour Quota Window, so that the keepalive exercises the requested Gemini model.
-9. As an Antigravity user, I want `claude-sonnet-4-6` targeted for the Claude/GPT five-hour Quota Window, so that the keepalive exercises the requested Claude model.
+9. As an Antigravity user, I want `claude-sonnet-5-5-high` targeted for the Claude/GPT five-hour Quota Window, so that the keepalive exercises the requested Claude model.
 10. As an Antigravity user, I want weekly quota buckets ignored by scheduling, so that the plugin does not create extra requests at weekly resets.
 11. As a CLIProxyAPI operator, I want a new Antigravity target to wait for the configured daily anchor, so that first activation follows the plugin's established schedule discipline.
 12. As a CLIProxyAPI operator, I want startup after the daily anchor to perform Schedule Catch-Up, so that an unanchored target does not wait until the next day.
@@ -49,7 +49,7 @@ The feature is a reset-aligned keepalive. It does not claim to increase, bypass,
 17. As a CLIProxyAPI operator, I want a changed Antigravity reset margin to apply after reconfiguration without overlapping schedulers, so that timing updates are safe and predictable.
 18. As a CLIProxyAPI operator, I want Antigravity inference routed through the host's native provider executor, so that OAuth refresh and protocol translation remain host responsibilities.
 19. As a CLIProxyAPI operator, I want every Antigravity inference pinned to the exact credential, so that a keepalive cannot consume another credential's quota.
-20. As a CLIProxyAPI operator, I want Antigravity execution forced to the Antigravity provider, so that `claude-sonnet-4-6` cannot route through a native Claude credential.
+20. As a CLIProxyAPI operator, I want Antigravity execution forced to the Antigravity provider, so that `claude-sonnet-5-5-high` cannot route through a native Claude credential.
 21. As a CLIProxyAPI operator, I want invalid, disabled, unavailable, or removed pinned credentials to fail closed, so that the host never silently falls back to another credential.
 22. As a plugin maintainer, I want CLIProxyAPI v7.3.3 or newer to be an explicit prerequisite, so that exact `auth_id` and `forced_provider` semantics are part of the supported host contract.
 23. As a plugin maintainer, I want no priority mutation or scheduler-boost fallback for Antigravity, so that the plugin does not rewrite credential state to achieve exact routing.
@@ -105,7 +105,7 @@ The feature is a reset-aligned keepalive. It does not claim to increase, bypass,
    - Existing installations with eligible Antigravity Credentials begin processing them after upgrade when global Auto-Ping is enabled; this is a deliberate consequence of the shared switch.
 
 3. **Fixed Antigravity targets**
-   - Each Eligible Antigravity Credential owns exactly two Auto-Ping Targets: Gemini five-hour using `gemini-3.8-flash-high`, and Claude/GPT five-hour using `claude-sonnet-4-6`.
+   - Each Eligible Antigravity Credential owns exactly two Auto-Ping Targets: Gemini five-hour using `gemini-3.8-flash-high`, and Claude/GPT five-hour using `claude-sonnet-5-5-high`.
    - Model IDs are fixed release behavior, not configurable candidates.
    - The targets have independent reset observations, trigger times, retry timing, terminal state, selected model, attempts, successes, and failures.
    - Weekly quota buckets never create Auto-Ping Targets and never gate the selected five-hour targets.

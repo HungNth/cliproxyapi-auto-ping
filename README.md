@@ -24,7 +24,7 @@ The private usage endpoint can fail, return stale data, or change shape. A stale
 For every eligible Antigravity credential, the plugin maintains two independent Auto-Ping Targets:
 
 - `gemini-3.8-flash-high` for the Gemini five-hour Quota Window;
-- `claude-sonnet-4-6` for the Claude/GPT five-hour Quota Window.
+- `claude-sonnet-5-5-high` for the Claude/GPT five-hour Quota Window.
 
 Weekly quota buckets are observed only as part of upstream payload data and never trigger Auto-Ping.
 
@@ -141,7 +141,7 @@ Manual ping body:
 }
 ```
 
-For Antigravity credentials, an omitted `model` executes both fixed targets (`gemini-3.8-flash-high` and `claude-sonnet-4-6`), while a specified model runs only that target:
+For Antigravity credentials, an omitted `model` executes both fixed targets (`gemini-3.8-flash-high` and `claude-sonnet-5-5-high`), while a specified model runs only that target:
 
 ```json
 {

@@ -16,7 +16,7 @@ Primary-source facts needed to add Google Antigravity targets without changing e
 
 ### Requested model IDs
 
-- `gemini-3.8-flash-high` and `claude-sonnet-4-6` are current Antigravity model IDs in the CLIProxyAPI model catalog.
+- `gemini-3.8-flash-high` and `claude-sonnet-5-5-high` are current Antigravity model IDs in the CLIProxyAPI model catalog.
 - Model availability is credential-specific; the host may reject a target that the exact credential cannot serve.
 - Source: [CLIProxyAPI model catalog](https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/registry/models/models.json)
 
@@ -67,7 +67,7 @@ Primary-source facts needed to add Google Antigravity targets without changing e
 1. One plugin exposes one lifecycle, global enablement setting, exclusion list, and management surface; Codex and Antigravity remain separate provider engines.
 2. Every eligible Antigravity credential gets two independent targets:
    - `gemini-3.8-flash-high` for the Gemini five-hour bucket.
-   - `claude-sonnet-4-6` for the Claude/GPT five-hour bucket.
+   - `claude-sonnet-5-5-high` for the Claude/GPT five-hour bucket.
 3. Weekly Antigravity buckets are observed only as unrelated payload data and never schedule Auto-Ping.
 4. An unanchored target bootstraps at the first applicable daily schedule milestone or catch-up. After anchoring, it runs only at `resetTime + antigravity_reset_margin`; the default margin is `30s`.
 5. Schedule milestones restart terminal attempt cycles but do not force daily pings for healthy anchored Antigravity targets.
